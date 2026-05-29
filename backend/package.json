@@ -1,16 +1,18 @@
 {
-  "name": "cdsl-dashboard-backend",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
+  "name": "cdsl-backend",
+  "version": "0.1.0",
+  "description": "CDSL operations dashboard backend",
+  "main": "server.js",
+  "type": "commonjs",
   "scripts": {
-    "dev": "node server.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "check": "node --check server.js && node --check routes/cdslRoutes.js && node --check controllers/cdslController.js && node --check services/cdslService.js && node --check middleware/errorHandler.js && node --check mock/fileDownloadBodFms.mock.js"
   },
   "dependencies": {
     "@google-cloud/bigquery": "^8.3.1",
-    "cors": "latest",
-    "dotenv": "latest",
-    "express": "latest"
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
   }
 }

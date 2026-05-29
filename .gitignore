@@ -1,4 +1,4 @@
-﻿# Logs
+﻿# ─── Logs ──────────────────────────────────────────────────
 logs/
 *.log
 npm-debug.log*
@@ -7,40 +7,77 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-# Dependencies
+# ─── Dependencies ──────────────────────────────────────────
 node_modules/
 backend/node_modules/
 
-# Build output
+# ─── Build output ──────────────────────────────────────────
 dist/
 dist-ssr/
+build/
+backend/dist/
 
-# Environment files
-*.local
+# ─── Environment files ─────────────────────────────────────
+# Root (Vite frontend)
 .env
 .env.local
 .env.development.local
 .env.test.local
 .env.production.local
+*.local
+
+# Backend
 backend/.env
 backend/.env.local
+backend/.env.development
+backend/.env.production
 backend/env
 
-# Secrets / credentials
-keys/
+# ─── Secrets / credentials ─────────────────────────────────
+# GCP service account keys — any name, any subfolder
+**/service-account.json
+**/service-account-*.json
+**/*-service-account.json
 backend/keys/
-backend/service-account.json
-backend/keys/service-account.json
+keys/
 *.pem
 *.key
+*.p12
+*.pfx
 
-# Editor directories and files
+# ─── BigQuery / GCP ────────────────────────────────────────
+# Local test scripts that contain project IDs or queries
+backend/bq-test.js
+backend/bq-debug.js
+backend/testBigQueryAdc.js
+backend/test*.js
+
+
+# ─── Coverage & test output ────────────────────────────────
+coverage/
+.nyc_output/
+
+# ─── Vite / frontend cache ─────────────────────────────────
+.vite/
+*.tsbuildinfo
+
+# ─── OS files ──────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Editor directories ────────────────────────────────────
 .vscode/*
 !.vscode/extensions.json
+!.vscode/settings.json
 .idea/
-.DS_Store
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+
+# ─── pnpm ──────────────────────────────────────────────────
+.pnpm-store/
+.pnpm-debug.log*
+
