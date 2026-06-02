@@ -268,14 +268,17 @@ async function getLiveBuddyData(ownerEmails) {
 
   const query = `
     SELECT
-      LOWER(OffEmailLower)          AS owner_email,
-      EmpAttendance                 AS emp_attendance,
-      EmpLeaveFlag                  AS emp_leave_flag,
-      LOWER(BuddyOffEmailLower)     AS buddy_email,
-      BuddyAttendance               AS buddy_attendance,
-      LOWER(ReportingOffEmailLower) AS reporting_email,
-      ReportingAttendance           AS reporting_attendance,
-      LOWER(FinalEmail)             AS final_email
+      LOWER(OffEmailLower)              AS owner_email,
+      Department                        AS department,
+      EmpAttendance                     AS emp_attendance,
+      EmpLeaveFlag                      AS emp_leave_flag,
+      ShiftInActual                     AS emp_shift_in_actual,
+      ShiftInBarrier                    AS emp_shift_in_barrier,
+      LOWER(BuddyOffEmailLower)         AS buddy_email,
+      BuddyAttendance                   AS buddy_attendance,
+      LOWER(ReportingOffEmailLower)     AS reporting_email,
+      ReportingAttendance               AS reporting_attendance,
+      LOWER(FinalEmail)                 AS final_email
     FROM \`universal-table-store\`.BuddySystem.BuddyMasterAutoPopulate
     WHERE LOWER(OffEmailLower) IN (${emailList})
   `;
@@ -290,6 +293,48 @@ async function getLiveBuddyData(ownerEmails) {
   return map;
 }
 
+
+
+// ── Check if person is present based on attendance + time ─────────────────────
+function isPersonPresent(attendance, leaveFlag, shiftInActual, shiftInBarrier) {
+  if (!attendance || attendance !== 1) return false;
+
+  const flag = (leaveFlag || "").toUpperCase().trim();
+
+  if (flag === "NOT IN" || flag === "") return false;
+
+  if (flag === "IN" || flag === "LEFT EARLY") return true;
+
+  if (
+    flag === "LATE IN" ||
+    flag === "LATE MORE THAN 30 MINUTES"
+  ) {
+    if (!shiftInActual) return false;
+    if (!shiftInBarrier) return true;
+
+    // Handle BigQuery timestamp objects { value: "2026-06-02T09:04:12" }
+    // and plain strings both
+    const toDate = (v) => {
+      if (!v) return null;
+      if (typeof v === "object" && v.value) return new Date(v.value);
+      return new Date(v);
+    };
+
+    const actual  = toDate(shiftInActual);
+    const barrier = toDate(shiftInBarrier);
+
+    if (!actual || isNaN(actual.getTime()))  return false;
+    if (!barrier || isNaN(barrier.getTime())) return true;
+
+    // 30 min cooloff after barrier
+    const cooloff = new Date(barrier.getTime() + 30 * 60 * 1000);
+
+    return actual <= cooloff;
+  }
+
+  // Any other flag with attendance=1 → present
+  return true;
+}
 // ── Resolve assignment from buddy data ────────────────────────────────────────
 function resolveAssignment(stepStatus, updatedBy, buddyData) {
   const status = (stepStatus || "").toUpperCase().trim();
@@ -309,30 +354,38 @@ function resolveAssignment(stepStatus, updatedBy, buddyData) {
       };
     }
 
-    if (
-      buddyData.emp_attendance === 1 &&
-      (buddyData.emp_leave_flag || "").toUpperCase() === "IN"
-    ) {
+    // Check owner presence with time logic
+    const ownerPresent = isPersonPresent(
+      buddyData.emp_attendance,
+      buddyData.emp_leave_flag,
+      buddyData.emp_shift_in_actual,
+      buddyData.emp_shift_in_barrier
+    );
+
+    if (ownerPresent) {
       return {
         assigned_email  : buddyData.owner_email,
         assignment_type : "SELF",
       };
     }
 
-    if (buddyData.buddy_attendance === 1) {
+    // Check buddy
+    if (buddyData.buddy_attendance === 1 && buddyData.buddy_email) {
       return {
         assigned_email  : buddyData.buddy_email,
         assignment_type : "BUDDY",
       };
     }
 
-    if (buddyData.reporting_attendance === 1) {
+    // Check reporting manager
+    if (buddyData.reporting_attendance === 1 && buddyData.reporting_email) {
       return {
         assigned_email  : buddyData.reporting_email,
         assignment_type : "REPORTING",
       };
     }
 
+    // Fallback
     return {
       assigned_email  : "systems@geplcapital.com",
       assignment_type : "ADMIN",
