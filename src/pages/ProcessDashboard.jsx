@@ -3,7 +3,8 @@ import { useParams } from "react-router-dom";
 import { RefreshCw, Search } from "lucide-react";
 import Logo from "../components/Logo";
 import {
-  ALLOWED_STATUSES,
+  getStepAllowedStatuses,
+  getRowClass,
   getStatusLabel,
   formatProcessName,
   computeStats,
@@ -21,19 +22,16 @@ function getUserEmail() {
 
 // ── Step Row ──────────────────────────────────────────────────────────────────
 function StepRow({ step, onStatusChange, updating }) {
+  const stepStatuses            = getStepAllowedStatuses(step);
   const [selected, setSelected] = useState(step.ui_status);
   const { label, cls }          = getStatusLabel(step.ui_status, step.is_overdue);
   const isBusy                  = updating === step.step_id;
+  const rowClass                = getRowClass(step);
 
   const handleSave = async () => {
     if (selected === step.ui_status) return;
     await onStatusChange(step.step_id, selected);
   };
-
-  const rowClass =
-    step.ui_status === "File Downloaded" ? "row-done"    :
-    step.is_overdue                      ? "row-overdue" :
-                                           "row-active";
 
   return (
     <tr className={rowClass}>
@@ -75,7 +73,7 @@ function StepRow({ step, onStatusChange, updating }) {
         <span className="exec-text">{step.how_to_execute || "—"}</span>
       </td>
 
-      {/* Assigned To — shows buddy-assigned email + assignment type */}
+      {/* Assigned To */}
       <td>
         <div>
           <span className="cell-role">
@@ -125,7 +123,7 @@ function StepRow({ step, onStatusChange, updating }) {
           : <span className="delay-none">—</span>}
       </td>
 
-      {/* Status */}
+      {/* Status — per-step dropdown from BigQuery allowed_statuses */}
       <td>
         <div className="status-cell">
           <select
@@ -134,7 +132,7 @@ function StepRow({ step, onStatusChange, updating }) {
             disabled={isBusy}
             className="status-select"
           >
-            {ALLOWED_STATUSES.map((s) => (
+            {stepStatuses.map((s) => (
               <option key={s} value={s}>{s}</option>
             ))}
           </select>
@@ -246,15 +244,18 @@ export default function ProcessDashboard() {
 
   // ── Derived data ──────────────────────────────────────────────────────────
   const steps = data.steps || [];
-  const { total, completed, pending, overdue, progress } = computeStats(steps);
+  const { total, completed, pending, overdue, exception, progress } = computeStats(steps);
   const filteredSteps = filterSteps(steps, search, filter);
 
+  // Collect all unique statuses across all steps for the filter dropdown
+  const allStatuses = [...new Set(steps.flatMap(s => s.allowed_statuses || []))];
+
   const statCards = [
-    { label: "Total Steps", value: total,          sub: "Today",                     cls: "info"   },
-    { label: "Completed",   value: completed,      sub: `${progress}% completion`,   cls: "good"   },
-    { label: "Pending",     value: pending,         sub: "Ready rows are actionable", cls: "warn"   },
-    { label: "Overdue",     value: overdue,         sub: "Needs attention",           cls: "danger" },
-    { label: "Progress",    value: `${progress}%`,  sub: "\u00a0",                   cls: "info"   },
+    { label: "Total Steps", value: total,      sub: "Today",                   cls: "info"   },
+    { label: "Completed",   value: completed,  sub: `${progress}% completion`, cls: "good"   },
+    { label: "Pending",     value: pending,    sub: "Ready rows",              cls: "warn"   },
+    { label: "Exception",   value: exception,  sub: "Needs attention",         cls: "danger" },
+    { label: "Overdue",     value: overdue,    sub: "Past planned time",       cls: "danger" },
   ];
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -314,7 +315,7 @@ export default function ProcessDashboard() {
                 className="filter-select"
               >
                 <option>All Status</option>
-                {ALLOWED_STATUSES.map((s) => (
+                {allStatuses.map((s) => (
                   <option key={s}>{s}</option>
                 ))}
               </select>

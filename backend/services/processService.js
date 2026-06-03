@@ -98,31 +98,7 @@ async function getProcessStep(processCode, stepId) {
 }
 
 // ── Init today's rows ─────────────────────────────────────────────────────────
-async function initProcessDay(processCode, processDate) {
-  const dateToInit = processDate || getTodayIST();
 
-  const query = `
-    CALL \`${projectId}.${DATASET_RUNTIME}.sp_init_process_day\`(
-      @processCode,
-      @processDate
-    )
-  `;
-
-  await bigquery.query({
-    query,
-    location,
-    params: {
-      processCode,
-      processDate: bigquery.date(dateToInit),
-    },
-  });
-
-  return {
-    process_code : processCode,
-    process_date : dateToInit,
-    message      : `Initialized process day for ${processCode} on ${dateToInit}`,
-  };
-}
 
 // ── Mark step status ──────────────────────────────────────────────────────────
 async function updateStepStatus(processCode, stepId, newStatus, changedBy) {
@@ -138,14 +114,14 @@ async function updateStepStatus(processCode, stepId, newStatus, changedBy) {
   const procStatus  = UI_TO_PROC_STATUS[newStatus];
 
   const query = `
-    CALL \`${projectId}.${DATASET_RUNTIME}.sp_mark_step_status\`(
-      @processCode,
-      @processDate,
-      @stepId,
-      @newStatus,
-      @changedBy
-    )
-  `;
+  CALL \`${projectId}.${DATASET_RUNTIME}.sp_mark_step_status\`(
+    @processDate,
+    @processCode,
+    @stepId,
+    @newStatus,
+    @changedBy
+  )
+`;
 
   await bigquery.query({
     query,
@@ -334,6 +310,61 @@ function isPersonPresent(attendance, leaveFlag, shiftInActual, shiftInBarrier) {
 
   // Any other flag with attendance=1 → present
   return true;
+}
+
+async function initProcessDay(processCode, processDate) {
+  const dateToInit = processDate || getTodayIST();
+
+  // Check if today is a working day
+  const [y, m, d]   = dateToInit.split("-");
+  const slashFormat = `${d}/${m}/${y}`;
+
+  const calQuery = `
+    SELECT COUNT(*) AS matched
+    FROM \`${projectId}.CDSL_CONFIG.trading_calendar\`
+    WHERE dd_mm_yyyy_slash = @dateSlash
+  `;
+
+  const [calRows] = await bigquery.query({
+    query    : calQuery,
+    location,
+    params   : { dateSlash: slashFormat },
+  });
+
+  const isWorking = (calRows[0]?.matched || 0) > 0;
+
+  if (!isWorking) {
+    return {
+      process_code : processCode,
+      process_date : dateToInit,
+      is_working   : false,
+      message      : `Skipped — ${dateToInit} is not a working day`,
+    };
+  }
+
+  // Working day — proceed with init
+  const query = `
+    CALL \`${projectId}.${DATASET_RUNTIME}.sp_init_process_day\`(
+      @processCode,
+      @processDate
+    )
+  `;
+
+  await bigquery.query({
+    query,
+    location,
+    params: {
+      processCode,
+      processDate: bigquery.date(dateToInit),
+    },
+  });
+
+  return {
+    process_code : processCode,
+    process_date : dateToInit,
+    is_working   : true,
+    message      : `Initialized process day for ${processCode} on ${dateToInit}`,
+  };
 }
 // ── Resolve assignment from buddy data ────────────────────────────────────────
 function resolveAssignment(stepStatus, updatedBy, buddyData) {
