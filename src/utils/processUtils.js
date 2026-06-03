@@ -1,4 +1,4 @@
-// ── Status options shown in dropdown ─────────────────────────────────────────
+// ── Fallback status list (used only if step.allowed_statuses is empty) ────────
 export const ALLOWED_STATUSES = [
   "File Downloaded",
   "File Not Received Today",
@@ -6,45 +6,59 @@ export const ALLOWED_STATUSES = [
   "Pending",
 ];
 
-// ── Derive UI label + CSS class — is_overdue flag comes from BigQuery ─────────
+// ── Get allowed statuses for a specific step ──────────────────────────────────
+// Uses step.allowed_statuses (ARRAY from BigQuery) if available
+// Falls back to ALLOWED_STATUSES for compatibility
+export function getStepAllowedStatuses(step) {
+  if (
+    step.allowed_statuses &&
+    Array.isArray(step.allowed_statuses) &&
+    step.allowed_statuses.length > 0
+  ) {
+    return step.allowed_statuses;
+  }
+  return ALLOWED_STATUSES;
+}
+
+// ── Row class based on completed/exception/overdue state ─────────────────────
+export function getRowClass(step) {
+  if (step.completed === "YES")        return "row-done";
+  if (step.completed === "EXCEPTION")  return "row-exception";
+  if (step.is_overdue)                 return "row-overdue";
+  return "row-active";
+}
+
+// ── Derive UI label + CSS class ───────────────────────────────────────────────
 export function getStatusLabel(uiStatus, isOverdue) {
-  if (uiStatus === "File Downloaded")
+  if (!uiStatus || uiStatus === "Pending") {
+    if (isOverdue) return { label: "Overdue - ready", cls: "overdue" };
+    return { label: "Ready to update", cls: "ready" };
+  }
+  const completedStatuses = [
+    "File Downloaded", "File Available", "File Imported Successfully",
+    "Report Generated", "Remarks Updated", "No Shortage",
+    "Payin File Generated", "File Uploaded", "Upload Successfully",
+    "Process Checked", "Completed", "Verified", "Reconciled",
+    "SMS/Email Sent", "File Generated", "Error Resolved", "YES",
+  ];
+  if (completedStatuses.includes(uiStatus)) {
     return { label: "Completed", cls: "done" };
-  if (uiStatus === "File Not Received Today")
-    return { label: "File Not Received", cls: "overdue" };
-  if (uiStatus === "Error from Exchange End")
-    return { label: "Error from Exchange", cls: "overdue" };
-  if (isOverdue)
-    return { label: "Overdue - ready", cls: "overdue" };
-  return { label: "Ready to update", cls: "ready" };
+  }
+  return { label: uiStatus, cls: "overdue" };
 }
-
-// ── Is this step overdue? ─────────────────────────────────────────────────────
-export function isOverdueRow(step) {
-  if (step.ui_status !== "Pending") return false;
-  if (!step.planned_time) return false;
-  const [h, m] = step.planned_time.split(":").map(Number);
-  const planned = new Date();
-  planned.setHours(h, m, 0, 0);
-  return new Date() > planned;
-}
-
-// ── Format process name: File_Download_BOD_FMS → File Download BOD FMS ───────
-export function formatProcessName(name = "") {
-  return name.replace(/_/g, " ");
-}
-
 
 // ── Compute summary stats from steps array ────────────────────────────────────
 export function computeStats(steps = []) {
   const total     = steps.length;
-  const completed = steps.filter(s => s.ui_status === "File Downloaded").length;
-  const pending   = steps.filter(s => s.ui_status === "Pending").length;
+  const completed = steps.filter(s => s.completed === "YES").length;
+  const exception = steps.filter(s => s.completed === "EXCEPTION").length;
+  const pending   = steps.filter(s =>
+    s.completed !== "YES" && s.completed !== "EXCEPTION"
+  ).length;
   const overdue   = steps.filter(s => s.is_overdue === true).length;
   const progress  = total > 0 ? Math.round((completed / total) * 100) : 0;
-  return { total, completed, pending, overdue, progress };
+  return { total, completed, pending, overdue, exception, progress };
 }
-
 
 // ── Filter steps by search text and status dropdown ───────────────────────────
 export function filterSteps(steps = [], search = "", statusFilter = "All Status") {
@@ -55,12 +69,19 @@ export function filterSteps(steps = [], search = "", statusFilter = "All Status"
       s.step_name?.toLowerCase().includes(q) ||
       s.step_id?.toLowerCase().includes(q) ||
       s.how_to_execute?.toLowerCase().includes(q) ||
-      s.owner_role?.toLowerCase().includes(q);
+      s.owner_role?.toLowerCase().includes(q) ||
+      s.assigned_email?.toLowerCase().includes(q);
     const matchFilter =
       statusFilter === "All Status" || s.ui_status === statusFilter;
     return matchSearch && matchFilter;
   });
 }
+
+// ── Format process name: File_Download_BOD_FMS → File Download BOD FMS ────────
+export function formatProcessName(name = "") {
+  return name.replace(/_/g, " ");
+}
+
 // ── Format date for display ───────────────────────────────────────────────────
 export function formatDisplayDate() {
   return new Date().toLocaleDateString("en-IN", {
