@@ -30,8 +30,11 @@ const StepRow = memo(function StepRow({ step, onStatusChange, updating }) {
   const [remark, setRemark]     = useState("");
 
   // Sync when data refreshes after save
+  // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setSelected(step.ui_status);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setRemark("");
   }, [step.ui_status, step.step_id]);
 
