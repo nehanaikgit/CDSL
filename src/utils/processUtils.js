@@ -6,12 +6,17 @@ export const ALLOWED_STATUSES = [
   "Pending",
 ];
 
+// ── Safely convert any value to lowercase searchable text ────────────────────
+function toSearchText(value) {
+  return String(value ?? "").toLowerCase();
+}
+
 // ── Get allowed statuses for a specific step ──────────────────────────────────
 // Uses step.allowed_statuses (ARRAY from BigQuery) if available
 // Falls back to ALLOWED_STATUSES for compatibility
-export function getStepAllowedStatuses(step) {
+// Does NOT prepend ui_status — current status is already in the allowed list
+export function getStepAllowedStatuses(step = {}) {
   if (
-    step.allowed_statuses &&
     Array.isArray(step.allowed_statuses) &&
     step.allowed_statuses.length > 0
   ) {
@@ -21,74 +26,94 @@ export function getStepAllowedStatuses(step) {
 }
 
 // ── Row class based on completed/exception/overdue state ─────────────────────
-export function getRowClass(step) {
-  if (step.completed === "YES")        return "row-done";
-  if (step.completed === "EXCEPTION")  return "row-exception";
-  if (step.is_overdue)                 return "row-overdue";
+export function getRowClass(step = {}) {
+  if (step.completed === "YES")       return "row-done";
+  if (step.completed === "EXCEPTION") return "row-exception";
+  if (step.is_overdue)                return "row-overdue";
   return "row-active";
 }
 
 // ── Derive UI label + CSS class ───────────────────────────────────────────────
-export function getStatusLabel(uiStatus, isOverdue) {
+// Driven by completed field from BigQuery — no hardcoded status lists
+export function getStatusLabel(uiStatus, isOverdue, completed) {
   if (!uiStatus || uiStatus === "Pending") {
     if (isOverdue) return { label: "Overdue - ready", cls: "overdue" };
     return { label: "Ready to update", cls: "ready" };
   }
-  const completedStatuses = [
-    "File Downloaded", "File Available", "File Imported Successfully",
-    "Report Generated", "Remarks Updated", "No Shortage",
-    "Payin File Generated", "File Uploaded", "Upload Successfully",
-    "Process Checked", "Completed", "Verified", "Reconciled",
-    "SMS/Email Sent", "File Generated", "Error Resolved", "YES",
-  ];
-  if (completedStatuses.includes(uiStatus)) {
-    return { label: "Completed", cls: "done" };
-  }
-  return { label: uiStatus, cls: "overdue" };
+
+  // Use completed field from BigQuery as source of truth
+  if (completed === "YES")        return { label: "Completed",  cls: "done"    };
+  if (completed === "EXCEPTION")  return { label: uiStatus,     cls: "overdue" };
+
+  // Fallback for PENDING steps with a non-default ui_status
+  if (isOverdue) return { label: "Overdue - ready", cls: "overdue" };
+  return { label: "Ready to update", cls: "ready" };
 }
 
 // ── Compute summary stats from steps array ────────────────────────────────────
 export function computeStats(steps = []) {
   const total     = steps.length;
-  const completed = steps.filter(s => s.completed === "YES").length;
-  const exception = steps.filter(s => s.completed === "EXCEPTION").length;
-  const pending   = steps.filter(s =>
+  const completed = steps.filter((s) => s.completed === "YES").length;
+  const exception = steps.filter((s) => s.completed === "EXCEPTION").length;
+  const pending   = steps.filter((s) =>
     s.completed !== "YES" && s.completed !== "EXCEPTION"
   ).length;
-  const overdue   = steps.filter(s => s.is_overdue === true).length;
+  const overdue   = steps.filter((s) =>
+    s.is_overdue === true &&
+    s.completed !== "YES" &&
+    s.completed !== "EXCEPTION"
+  ).length;
   const progress  = total > 0 ? Math.round((completed / total) * 100) : 0;
+
   return { total, completed, pending, overdue, exception, progress };
 }
 
 // ── Filter steps by search text and status dropdown ───────────────────────────
 export function filterSteps(steps = [], search = "", statusFilter = "All Status") {
-  const q = search.toLowerCase();
+  const q = toSearchText(search).trim();
+
   return steps.filter((s) => {
-    const matchSearch =
-      !search ||
-      s.step_name?.toLowerCase().includes(q) ||
-      s.step_id?.toLowerCase().includes(q) ||
-      s.how_to_execute?.toLowerCase().includes(q) ||
-      s.owner_role?.toLowerCase().includes(q) ||
-      s.assigned_email?.toLowerCase().includes(q);
-    const matchFilter =
+    const searchableText = [
+      s.process_date,
+      s.step_id,
+      s.step_name,
+      s.system_name,
+      s.path_navigation_url,
+      s.how_to_execute,
+      s.owner_role,
+      s.assigned_email,
+      s.assignment_type,
+      s.ui_status,
+      s.completed,
+      s.exception_reason,
+    ]
+      .map(toSearchText)
+      .join(" ");
+
+    const matchSearch  = !q || searchableText.includes(q);
+    const matchFilter  =
       statusFilter === "All Status" || s.ui_status === statusFilter;
+
     return matchSearch && matchFilter;
   });
 }
 
 // ── Format process name: File_Download_BOD_FMS → File Download BOD FMS ────────
 export function formatProcessName(name = "") {
-  return name.replace(/_/g, " ");
+  return String(name || "")
+    .replace(/_/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 // ── Format date for display ───────────────────────────────────────────────────
 export function formatDisplayDate() {
   return new Date().toLocaleDateString("en-IN", {
-    weekday: "short",
-    day: "2-digit",
-    month: "short",
-    year: "numeric",
+    weekday  : "short",
+    day      : "2-digit",
+    month    : "short",
+    year     : "numeric",
+    timeZone : "Asia/Kolkata",
   });
 }
 
@@ -96,7 +121,8 @@ export function formatDisplayDate() {
 export function formatRefreshTime(date) {
   if (!date) return "";
   return `Updated: ${date.toLocaleTimeString("en-IN", {
-    hour: "2-digit",
-    minute: "2-digit",
+    hour     : "2-digit",
+    minute   : "2-digit",
+    timeZone : "Asia/Kolkata",
   })}`;
 }
