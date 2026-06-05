@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, memo } from "react";
 import { useParams } from "react-router-dom";
 import { RefreshCw, Search } from "lucide-react";
 import Logo from "../components/Logo";
@@ -15,43 +15,52 @@ import {
 import { getProcessSteps, updateStepStatus } from "../services/apiClient";
 import "./ProcessDashboard.css";
 
-// ── Get user email ────────────────────────────────────────────────────────────
 function getUserEmail() {
   return localStorage.getItem("cdsl_user_email") || "nehanaik@geplcapital.com";
 }
 
-// ── Step Row ──────────────────────────────────────────────────────────────────
-function StepRow({ step, onStatusChange, updating }) {
-  const stepStatuses            = getStepAllowedStatuses(step);
+// ── Step Row — memoized to prevent unnecessary re-renders ─────────────────────
+const StepRow = memo(function StepRow({ step, onStatusChange, updating }) {
+  const stepStatuses      = getStepAllowedStatuses(step);
+  const exceptionStatuses = Array.isArray(step.exception_statuses)
+    ? step.exception_statuses
+    : [];
+
   const [selected, setSelected] = useState(step.ui_status);
-  const { label, cls }          = getStatusLabel(step.ui_status, step.is_overdue);
-  const isBusy                  = updating === step.step_id;
-  const rowClass                = getRowClass(step);
+  const [remark, setRemark]     = useState("");
+
+  // Sync when data refreshes after save
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setSelected(step.ui_status);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setRemark("");
+  }, [step.ui_status, step.step_id]);
+
+  const { label, cls } = getStatusLabel(selected, step.is_overdue, step.completed);
+  const isBusy         = updating === step.step_id;
+  const rowClass       = getRowClass(step);
+
+  // Show remark box ONLY when changing TO an exception status
+  const showRemarkBox =
+    exceptionStatuses.length > 0 &&
+    exceptionStatuses.includes(selected) &&
+    selected !== step.ui_status;
 
   const handleSave = async () => {
-    if (selected === step.ui_status) return;
-    await onStatusChange(step.step_id, selected);
+    if (selected === step.ui_status && !remark.trim()) return;
+    await onStatusChange(step.step_id, selected, remark.trim());
+    setRemark("");
   };
 
   return (
     <tr className={rowClass}>
 
-      {/* Process Date */}
-      <td>
-        <span className="cell-date">{step.process_date}</span>
-      </td>
+      <td><span className="cell-date">{step.process_date || "—"}</span></td>
+      <td><span className="cell-step">{step.step_id || "—"}</span></td>
+      <td><span className="cell-name">{step.step_name || "—"}</span></td>
 
-      {/* Step ID */}
-      <td>
-        <span className="cell-step">{step.step_id}</span>
-      </td>
-
-      {/* Step Name */}
-      <td>
-        <span className="cell-name">{step.step_name}</span>
-      </td>
-
-      {/* Path */}
       <td className="path-cell">
         {step.path_navigation_url ? (
           <a
@@ -68,12 +77,10 @@ function StepRow({ step, onStatusChange, updating }) {
         )}
       </td>
 
-      {/* How to Execute */}
       <td className="exec-cell">
         <span className="exec-text">{step.how_to_execute || "—"}</span>
       </td>
 
-      {/* Assigned To */}
       <td>
         <div>
           <span className="cell-role">
@@ -81,10 +88,10 @@ function StepRow({ step, onStatusChange, updating }) {
           </span>
           {step.assignment_type && step.assignment_type !== "COMPLETED_BY" && (
             <div style={{
-              fontSize: "10px",
+              fontSize  : "10px",
               fontWeight: 700,
-              marginTop: 3,
-              color:
+              marginTop : 3,
+              color     :
                 step.assignment_type === "SELF"      ? "var(--green)"  :
                 step.assignment_type === "BUDDY"     ? "var(--navy)"   :
                 step.assignment_type === "REPORTING" ? "var(--amber)"  :
@@ -96,7 +103,6 @@ function StepRow({ step, onStatusChange, updating }) {
         </div>
       </td>
 
-      {/* Planned Time */}
       <td>
         {step.planned_time ? (
           <div className="time-wrap">
@@ -106,7 +112,6 @@ function StepRow({ step, onStatusChange, updating }) {
         ) : <span className="delay-none">—</span>}
       </td>
 
-      {/* Actual Time */}
       <td>
         {step.actual_time ? (
           <div className="time-wrap">
@@ -116,19 +121,18 @@ function StepRow({ step, onStatusChange, updating }) {
         ) : <span className="delay-none">—</span>}
       </td>
 
-      {/* Delay */}
       <td>
-        {step.delay_minutes > 0
+        {Number(step.delay_minutes) > 0
           ? <span className="delay-late">+{step.delay_minutes}m</span>
           : <span className="delay-none">—</span>}
       </td>
 
-      {/* Status — per-step dropdown from BigQuery allowed_statuses */}
       <td>
         <div className="status-cell">
+
           <select
             value={selected}
-            onChange={(e) => setSelected(e.target.value)}
+            onChange={(e) => { setSelected(e.target.value); setRemark(""); }}
             disabled={isBusy}
             className="status-select"
           >
@@ -136,10 +140,51 @@ function StepRow({ step, onStatusChange, updating }) {
               <option key={s} value={s}>{s}</option>
             ))}
           </select>
+
+          {/* Remark box — only when actively changing to exception status */}
+          {showRemarkBox && (
+            <textarea
+              value={remark}
+              onChange={(e) => setRemark(e.target.value)}
+              placeholder="Add reason (optional)"
+              disabled={isBusy}
+              rows={2}
+              style={{
+                width          : "100%",
+                marginTop      : 6,
+                padding        : "4px 6px",
+                fontSize       : 11,
+                border         : "1px solid var(--red)",
+                borderRadius   : 4,
+                resize         : "vertical",
+                fontFamily     : "inherit",
+                backgroundColor: "var(--bg)",
+                color          : "var(--text)",
+              }}
+            />
+          )}
+
+          {/* Show stored reason — only if it's different from status name */}
+          {step.completed === "EXCEPTION" &&
+           step.exception_reason &&
+           step.exception_reason !== step.ui_status && (
+            <div style={{
+              fontSize  : 10,
+              color     : "var(--red)",
+              marginTop : 3,
+              fontStyle : "italic",
+              lineHeight: 1.4,
+            }}>
+              Reason: {step.exception_reason}
+            </div>
+          )}
+
           <div className="status-footer">
             <span className={`status-label ${cls}`}>{label}</span>
-            {selected !== step.ui_status && (
+            {(selected !== step.ui_status ||
+              (showRemarkBox && remark.trim())) && (
               <button
+                type="button"
                 onClick={handleSave}
                 disabled={isBusy}
                 className="save-btn"
@@ -148,12 +193,13 @@ function StepRow({ step, onStatusChange, updating }) {
               </button>
             )}
           </div>
+
         </div>
       </td>
 
     </tr>
   );
-}
+});
 
 // ── Main Dashboard ────────────────────────────────────────────────────────────
 export default function ProcessDashboard() {
@@ -167,46 +213,42 @@ export default function ProcessDashboard() {
   const [lastRefresh, setLastRefresh] = useState(null);
   const [currentUser]                 = useState(() => getUserEmail());
 
-  // ── fetchData ─────────────────────────────────────────────────────────────
   const fetchData = useCallback(async () => {
     try {
       setLoading(true);
-      setError(null);
       const res = await getProcessSteps(processCode);
       setData(res.data);
       setLastRefresh(new Date());
+      setError(null);
     } catch (err) {
-      setError(err.message);
+      setError(err.message || "Failed to load dashboard data");
     } finally {
       setLoading(false);
     }
   }, [processCode]);
 
-  // ── Initial load ──────────────────────────────────────────────────────────
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    fetchData();
-  }, [fetchData]);
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(() => { fetchData(); }, [fetchData]);
 
-  // ── Auto refresh every 5 minutes ─────────────────────────────────────────
+  // Auto refresh every 5 minutes
   useEffect(() => {
     const interval = setInterval(fetchData, 5 * 60 * 1000);
     return () => clearInterval(interval);
   }, [fetchData]);
 
-  // ── Status update ─────────────────────────────────────────────────────────
-  const handleStatusChange = async (stepId, newStatus) => {
-    setData(prev => ({
-      ...prev,
-      steps: prev.steps.map(s =>
-        s.step_id === stepId
-          ? { ...s, ui_status: newStatus }
-          : s
-      ),
-    }));
+  const handleStatusChange = useCallback(async (stepId, newStatus, remark = "") => {
+    setData((prev) => {
+      if (!prev || !Array.isArray(prev.steps)) return prev;
+      return {
+        ...prev,
+        steps: prev.steps.map((s) =>
+          s.step_id === stepId ? { ...s, ui_status: newStatus } : s
+        ),
+      };
+    });
     try {
       setUpdating(stepId);
-      await updateStepStatus(processCode, stepId, newStatus, currentUser);
+      await updateStepStatus(processCode, stepId, newStatus, currentUser, remark);
       await fetchData();
     } catch (err) {
       alert(`Failed to update: ${err.message}`);
@@ -214,9 +256,8 @@ export default function ProcessDashboard() {
     } finally {
       setUpdating(null);
     }
-  };
+  }, [processCode, currentUser, fetchData]);
 
-  // ── Loading ───────────────────────────────────────────────────────────────
   if (loading && !data) {
     return (
       <div className="loading-wrap">
@@ -226,15 +267,12 @@ export default function ProcessDashboard() {
     );
   }
 
-  // ── Error ─────────────────────────────────────────────────────────────────
-  if (error) {
+  if (error && !data) {
     return (
       <div className="error-wrap">
         <div style={{ textAlign: "center" }}>
-          <div style={{ color: "var(--red)", fontSize: 13, marginBottom: 8 }}>
-            {error}
-          </div>
-          <button onClick={fetchData} className="retry-btn">Retry</button>
+          <div style={{ color: "var(--red)", fontSize: 13, marginBottom: 8 }}>{error}</div>
+          <button type="button" onClick={fetchData} className="retry-btn">Retry</button>
         </div>
       </div>
     );
@@ -242,31 +280,24 @@ export default function ProcessDashboard() {
 
   if (!data) return null;
 
-  // ── Derived data ──────────────────────────────────────────────────────────
-  const steps = data.steps || [];
+  const steps         = data.steps || [];
   const { total, completed, pending, overdue, exception, progress } = computeStats(steps);
   const filteredSteps = filterSteps(steps, search, filter);
-
-  // Collect all unique statuses across all steps for the filter dropdown
-  const allStatuses = [...new Set(steps.flatMap(s => s.allowed_statuses || []))];
+  const allStatuses   = [...new Set(steps.flatMap((s) => s.allowed_statuses || []))];
 
   const statCards = [
-    { label: "Total Steps", value: total,      sub: "Today",                   cls: "info"   },
-    { label: "Completed",   value: completed,  sub: `${progress}% completion`, cls: "good"   },
-    { label: "Pending",     value: pending,    sub: "Ready rows",              cls: "warn"   },
-    { label: "Exception",   value: exception,  sub: "Needs attention",         cls: "danger" },
-    { label: "Overdue",     value: overdue,    sub: "Past planned time",       cls: "danger" },
+    { label: "Total Steps", value: total,     sub: "Today",                   cls: "info"   },
+    { label: "Completed",   value: completed, sub: `${progress}% completion`, cls: "good"   },
+    { label: "Pending",     value: pending,   sub: "Ready rows",              cls: "warn"   },
+    { label: "Exception",   value: exception, sub: "Needs attention",         cls: "danger" },
+    { label: "Overdue",     value: overdue,   sub: "Past planned time",       cls: "danger" },
   ];
 
-  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div style={{ height: "100vh", display: "flex", flexDirection: "column" }}>
 
-      {/* Header */}
       <header className="app-header">
-        <div className="header-left">
-          <Logo height={36} />
-        </div>
+        <div className="header-left"><Logo height={36} /></div>
         <h1 className="header-title">
           {formatProcessName(data.process_name)} Dashboard
         </h1>
@@ -276,10 +307,8 @@ export default function ProcessDashboard() {
         </div>
       </header>
 
-      {/* Body */}
       <div className="dashboard-wrap">
 
-        {/* Stat Cards */}
         <div className="stat-bar">
           {statCards.map((s) => (
             <div key={s.label} className="stat-card">
@@ -290,10 +319,8 @@ export default function ProcessDashboard() {
           ))}
         </div>
 
-        {/* Table Card */}
         <div className="table-card">
 
-          {/* Toolbar */}
           <div className="toolbar">
             <div className="toolbar-left">
               <span className="step-summary">
@@ -316,17 +343,30 @@ export default function ProcessDashboard() {
               >
                 <option>All Status</option>
                 {allStatuses.map((s) => (
-                  <option key={s}>{s}</option>
+                  <option key={s} value={s}>{s}</option>
                 ))}
               </select>
             </div>
+
             <div className="toolbar-right">
+              {error && data && (
+                <span style={{
+                  color       : "var(--red)",
+                  fontSize    : "11px",
+                  fontWeight  : 700,
+                  background  : "var(--red-bg)",
+                  border      : "1px solid #fecdd3",
+                  borderRadius: "999px",
+                  padding     : "5px 9px",
+                }}>
+                  Refresh failed
+                </span>
+              )}
               <span className="updated-text">{formatRefreshTime(lastRefresh)}</span>
               <span className="range-label">Range</span>
-              <select className="filter-select">
-                <option>Today</option>
-              </select>
+              <select className="filter-select"><option>Today</option></select>
               <button
+                type="button"
                 onClick={fetchData}
                 disabled={loading}
                 className="refresh-btn"
@@ -337,7 +377,6 @@ export default function ProcessDashboard() {
             </div>
           </div>
 
-          {/* Table */}
           <div className="table-container">
             <table className="data-table">
               <thead>
@@ -362,7 +401,7 @@ export default function ProcessDashboard() {
                 ) : (
                   filteredSteps.map((step) => (
                     <StepRow
-                      key={`${step.step_id}-${step.ui_status}-${step.is_overdue}`}
+                      key={`${step.step_id}-${step.process_date}`}
                       step={step}
                       onStatusChange={handleStatusChange}
                       updating={updating}
@@ -373,7 +412,6 @@ export default function ProcessDashboard() {
             </table>
           </div>
 
-          {/* Footer */}
           <div className="table-footer">
             Source: BigQuery · {data.process_code} · {total} steps
             {currentUser && (

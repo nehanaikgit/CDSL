@@ -456,11 +456,13 @@ html, body, #root {
 }
 
 .time-wrap { line-height: 1.18; }
+
 .time-date {
   font-size: .68rem;
   color: var(--text-muted);
   margin-bottom: 2px;
 }
+
 .time-hour {
   font-family: var(--font-mono);
   font-size: .8rem;
@@ -614,9 +616,267 @@ html, body, #root {
   50%       { opacity: .35; }
 }
 
-@media (max-width: 1100px) {
-  .stat-bar { grid-template-columns: repeat(2, minmax(160px, 1fr)); }
-  .toolbar  { grid-template-columns: 1fr; }
-  .toolbar-right { justify-content: flex-start; }
-  .header-title  { font-size: 13px; }
+/* ─────────────────────────────────────────────────────────────────────────── */
+/* RESPONSIVE: LAPTOP / SMALL DESKTOP */
+/* ─────────────────────────────────────────────────────────────────────────── */
+
+@media (max-width: 1200px) {
+  .stat-bar {
+    grid-template-columns: repeat(3, minmax(160px, 1fr));
+  }
+
+  .toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .toolbar-right {
+    justify-content: flex-start;
+  }
+
+  .search-wrap {
+    max-width: none;
+  }
+}
+
+@media (max-width: 900px) {
+  html, body, #root {
+    font-size: 12px;
+  }
+
+  .app-header {
+    grid-template-columns: auto 1fr auto;
+    padding: 0 12px;
+  }
+
+  .header-title {
+    font-size: 12px;
+    white-space: normal;
+    line-height: 1.2;
+  }
+
+  .header-right {
+    font-size: .68rem;
+  }
+
+  .dashboard-wrap {
+    padding: 10px;
+    overflow: auto;
+  }
+
+  .stat-bar {
+    grid-template-columns: repeat(2, minmax(140px, 1fr));
+    gap: 8px;
+  }
+
+  .stat-card {
+    min-height: 68px;
+    padding: 10px 12px;
+  }
+
+  .toolbar-left,
+  .toolbar-right {
+    align-items: stretch;
+  }
+
+  .step-summary,
+  .search-wrap,
+  .filter-select,
+  .refresh-btn {
+    width: 100%;
+    max-width: none;
+  }
+
+  .refresh-btn {
+    justify-content: center;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────── */
+/* TRUE MOBILE RESPONSIVE TABLE */
+/* Table becomes card layout */
+/* ─────────────────────────────────────────────────────────────────────────── */
+
+@media (max-width: 700px) {
+  .app-header {
+    height: auto;
+    min-height: 56px;
+    grid-template-columns: 1fr;
+    gap: 4px;
+    padding: 8px 12px;
+  }
+
+  .header-left {
+    justify-content: center;
+  }
+
+  .header-title {
+    text-align: center;
+    font-size: 12px;
+  }
+
+  .header-right {
+    justify-content: center;
+    font-size: 11px;
+  }
+
+  .dashboard-wrap {
+    height: auto;
+    min-height: calc(100vh - 56px);
+    overflow: visible;
+  }
+
+  .stat-bar {
+    grid-template-columns: 1fr;
+  }
+
+  .table-card {
+    overflow: visible;
+  }
+
+  .table-container {
+    overflow: visible;
+  }
+
+  .data-table {
+    min-width: 0;
+    width: 100%;
+    display: block;
+  }
+
+  .data-table thead {
+    display: none;
+  }
+
+  .data-table tbody {
+    display: block;
+    width: 100%;
+  }
+
+  .data-table tbody tr {
+    display: block;
+    width: 100%;
+    background: #fff;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    margin-bottom: 12px;
+    padding: 8px 10px;
+    box-shadow: var(--shadow-sm);
+  }
+
+  .data-table tbody tr:hover {
+    box-shadow: var(--shadow-sm);
+  }
+
+  .data-table td {
+    display: grid;
+    grid-template-columns: 125px 1fr;
+    gap: 10px;
+    align-items: start;
+    width: 100%;
+    border-right: none;
+    border-bottom: 1px solid var(--border-soft);
+    padding: 9px 4px;
+    font-size: 12px;
+  }
+
+  .data-table td:last-child {
+    border-bottom: none;
+  }
+
+  .data-table td::before {
+    font-size: 10px;
+    font-weight: 800;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: .4px;
+    line-height: 1.3;
+  }
+
+  .data-table td:nth-child(1)::before { content: "Process Date"; }
+  .data-table td:nth-child(2)::before { content: "Step ID"; }
+  .data-table td:nth-child(3)::before { content: "Step Name"; }
+  .data-table td:nth-child(4)::before { content: "Path / URL"; }
+  .data-table td:nth-child(5)::before { content: "How To Execute"; }
+  .data-table td:nth-child(6)::before { content: "Assigned To"; }
+  .data-table td:nth-child(7)::before { content: "Planned Time"; }
+  .data-table td:nth-child(8)::before { content: "Actual Time"; }
+  .data-table td:nth-child(9)::before { content: "Delay"; }
+  .data-table td:nth-child(10)::before { content: "Status"; }
+
+  .cell-name,
+  .cell-role,
+  .path-cell,
+  .exec-cell,
+  .path-box,
+  .exec-text {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .path-cell,
+  .exec-cell {
+    width: 100%;
+  }
+
+  .path-box {
+    font-size: 11px;
+    padding: 6px 8px;
+  }
+
+  .exec-text {
+    font-size: 11px;
+  }
+
+  .status-cell {
+    width: 100%;
+  }
+
+  .status-select {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .status-footer {
+    width: 100%;
+  }
+
+  .table-footer {
+    text-align: left;
+    line-height: 1.5;
+  }
+
+  .no-rows {
+    display: block !important;
+    text-align: center;
+    padding: 24px 10px;
+  }
+
+  .no-rows::before {
+    display: none !important;
+    content: "";
+  }
+}
+
+@media (max-width: 430px) {
+  .dashboard-wrap {
+    padding: 8px;
+  }
+
+  .toolbar {
+    padding: 10px;
+  }
+
+  .data-table td {
+    grid-template-columns: 100px 1fr;
+    gap: 8px;
+  }
+
+  .stat-value {
+    font-size: 1.25rem;
+  }
+
+  .step-summary {
+    white-space: normal;
+    line-height: 1.4;
+  }
 }

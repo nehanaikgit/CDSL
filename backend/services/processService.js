@@ -1,15 +1,32 @@
-const { bigquery, projectId, location } = require("../config/bigQueryClient");
+const { bigquery, fastQuery, directQuery, projectId, location } = require("../config/bigQueryClient");
 
 const DATASET_REPORTING = process.env.BQ_DATASET_REPORTING || "CDSL_REPORTING";
 const DATASET_RUNTIME   = process.env.BQ_DATASET_RUNTIME   || "CDSL_RUNTIME";
+const DATASET_CONFIG    = process.env.BQ_DATASET_CONFIG    || "CDSL_CONFIG";
 
-// ── Status mapping ────────────────────────────────────────────────────────────
-const UI_TO_PROC_STATUS = {
-  "File Downloaded"         : "File Downloaded",
-  "File Not Received Today" : "File Not Received Today",
-  "Error from Exchange End" : "Error from Exchange End",
-  "Pending"                 : "PENDING",
+// ── In-memory cache for buddy data ────────────────────────────────────────────
+const cache = {
+  buddy: { data: {}, ts: 0, TTL: 30 * 60 * 1000 }, // 30 min
 };
+
+// ── Get all active processes ──────────────────────────────────────────────────
+async function getProcesses() {
+  const query = `
+    SELECT
+      process_code,
+      process_name,
+      process_slug,
+      module,
+      planned_time,
+      description
+    FROM \`${projectId}.${DATASET_CONFIG}.process_master\`
+    WHERE is_active = TRUE
+    ORDER BY module, planned_time, process_name
+  `;
+  // Small table — directQuery is faster (no job creation overhead)
+  const [rows] = await directQuery({ query, location });
+  return rows;
+}
 
 // ── Get all steps for a process (latest day) ──────────────────────────────────
 async function getProcessSteps(processCode) {
@@ -26,12 +43,8 @@ async function getProcessSteps(processCode) {
     WHERE v.process_code = @processCode
     ORDER BY v.step_no ASC
   `;
-
-  const [rows] = await bigquery.query({
-    query,
-    location,
-    params: { processCode },
-  });
+  // Heavy view join — fastQuery with 300ms polling
+  const [rows] = await fastQuery({ query, location, params: { processCode } });
 
   if (!rows.length) {
     const err = new Error(`No data found for process: ${processCode}`);
@@ -39,7 +52,6 @@ async function getProcessSteps(processCode) {
     throw err;
   }
 
-  // Get unique owner emails
   const ownerEmails = [
     ...new Set(
       rows
@@ -48,10 +60,8 @@ async function getProcessSteps(processCode) {
     ),
   ];
 
-  // Fetch LIVE buddy data from HRMantra (US region)
   const buddyMap = await getLiveBuddyData(ownerEmails);
 
-  // Enrich each step with live assignment
   const enrichedRows = rows.map(row => {
     const buddyData = buddyMap[(row.owner_email || "").toLowerCase()] || null;
     const { assigned_email, assignment_type } = resolveAssignment(
@@ -81,57 +91,62 @@ async function getProcessStep(processCode, stepId) {
       AND v.step_id      = @stepId
     LIMIT 1
   `;
-
-  const [rows] = await bigquery.query({
-    query,
-    location,
-    params: { processCode, stepId },
-  });
+  const [rows] = await fastQuery({ query, location, params: { processCode, stepId } });
 
   if (!rows.length) {
     const err = new Error(`Step not found: ${stepId} in process: ${processCode}`);
     err.statusCode = 404;
     throw err;
   }
-
   return rows[0];
 }
 
-// ── Init today's rows ─────────────────────────────────────────────────────────
-
-
 // ── Mark step status ──────────────────────────────────────────────────────────
-async function updateStepStatus(processCode, stepId, newStatus, changedBy) {
-  if (!Object.prototype.hasOwnProperty.call(UI_TO_PROC_STATUS, newStatus)) {
+async function updateStepStatus(processCode, stepId, newStatus, changedBy, remark = '') {
+  // Small count query — directQuery (no polling overhead)
+  const [validateRows] = await directQuery({
+    query : `
+      SELECT COUNT(*) AS cnt
+      FROM \`${projectId}.${DATASET_CONFIG}.allowed_statuses\`
+      WHERE process_code = @processCode
+        AND status_value = @newStatus
+        AND is_active    = TRUE
+    `,
+    location,
+    params: { processCode, newStatus },
+  });
+
+  if ((validateRows[0]?.cnt || 0) === 0) {
     const err = new Error(
-      `Invalid status: "${newStatus}". Allowed: ${Object.keys(UI_TO_PROC_STATUS).join(", ")}`
+      `Invalid status: "${newStatus}" for process "${processCode}"`
     );
     err.statusCode = 400;
     throw err;
   }
 
+  // Small date lookup — directQuery
   const processDate = await getLatestProcessDate(processCode);
-  const procStatus  = UI_TO_PROC_STATUS[newStatus];
 
-  const query = `
-  CALL \`${projectId}.${DATASET_RUNTIME}.sp_mark_step_status\`(
-    @processDate,
-    @processCode,
-    @stepId,
-    @newStatus,
-    @changedBy
-  )
-`;
-
-  await bigquery.query({
-    query,
+  // CALL procedure — fastQuery (stored procedure may take time)
+  await fastQuery({
+    query : `
+      CALL \`${projectId}.${DATASET_RUNTIME}.sp_mark_step_status\`(
+        @processDate,
+        @processCode,
+        @stepId,
+        @newStatus,
+        @changedBy,
+        @remark
+      )
+    `,
     location,
     params: {
-      processCode,
       processDate : bigquery.date(processDate),
+      processCode,
       stepId,
-      newStatus   : procStatus,
+      newStatus,
       changedBy   : changedBy || "SYSTEM",
+      remark      : remark || "",
     },
   });
 
@@ -145,10 +160,59 @@ async function updateStepStatus(processCode, stepId, newStatus, changedBy) {
   };
 }
 
+// ── Init process day ──────────────────────────────────────────────────────────
+async function initProcessDay(processCode, processDate) {
+  const dateToInit = processDate || getTodayIST();
+  const [y, m, d]  = dateToInit.split("-");
+  const slashFormat = `${d}/${m}/${y}`;
+
+  // Small calendar lookup — directQuery
+  const [calRows] = await directQuery({
+    query : `
+      SELECT COUNT(*) AS matched
+      FROM \`${projectId}.${DATASET_CONFIG}.trading_calendar\`
+      WHERE dd_mm_yyyy_slash = @dateSlash
+    `,
+    location,
+    params: { dateSlash: slashFormat },
+  });
+
+  const isWorking = (calRows[0]?.matched || 0) > 0;
+  if (!isWorking) {
+    return {
+      process_code : processCode,
+      process_date : dateToInit,
+      is_working   : false,
+      message      : `Skipped — ${dateToInit} is not a working day`,
+    };
+  }
+
+  // CALL procedure — fastQuery
+  await fastQuery({
+    query : `
+      CALL \`${projectId}.${DATASET_RUNTIME}.sp_init_process_day\`(
+        @processDate,
+        @processCode
+      )
+    `,
+    location,
+    params: {
+      processDate : bigquery.date(dateToInit),
+      processCode,
+    },
+  });
+
+  return {
+    process_code : processCode,
+    process_date : dateToInit,
+    is_working   : true,
+    message      : `Initialized process day for ${processCode} on ${dateToInit}`,
+  };
+}
+
 // ── Archive a day ─────────────────────────────────────────────────────────────
 async function archiveProcessDay(processCode, processDate) {
   let dateToArchive = processDate;
-
   if (!dateToArchive || dateToArchive === "yesterday") {
     const yesterday = new Date();
     yesterday.setDate(yesterday.getDate() - 1);
@@ -157,19 +221,18 @@ async function archiveProcessDay(processCode, processDate) {
     });
   }
 
-  const query = `
-    CALL \`${projectId}.${DATASET_RUNTIME}.sp_archive_process_day\`(
-      @processCode,
-      @processDate
-    )
-  `;
-
-  await bigquery.query({
-    query,
+  // CALL procedure — fastQuery
+  await fastQuery({
+    query : `
+      CALL \`${projectId}.${DATASET_RUNTIME}.sp_archive_process_day\`(
+        @processDate,
+        @processCode
+      )
+    `,
     location,
     params: {
+      processDate : bigquery.date(dateToArchive),
       processCode,
-      processDate: bigquery.date(dateToArchive),
     },
   });
 
@@ -182,245 +245,157 @@ async function archiveProcessDay(processCode, processDate) {
 
 // ── Audit log ─────────────────────────────────────────────────────────────────
 async function getAuditLog(processCode, stepId = null) {
-  let query;
-  let params;
-
-  if (stepId) {
-    query = `
-      SELECT
-        FORMAT_TIMESTAMP('%d %b %Y %I:%M %p', al.changed_at, 'Asia/Kolkata') AS changed_at,
-        al.step_id,
-        sm.step_name,
-        al.old_status,
-        al.new_status,
-        al.changed_by,
-        al.delay_minutes,
-        al.exception_reason,
-        al.remarks
-      FROM \`${projectId}.CDSL_LOGS_NEW.step_audit_log\` al
-      LEFT JOIN \`${projectId}.CDSL_CONFIG.step_master\` sm
-        ON  al.process_code = sm.process_code
-        AND al.step_id      = sm.step_id
-      WHERE al.process_code = @processCode
-        AND al.step_id      = @stepId
-      ORDER BY al.changed_at DESC
-      LIMIT 100
-    `;
-    params = { processCode, stepId };
-  } else {
-    query = `
-      SELECT
-        FORMAT_TIMESTAMP('%d %b %Y %I:%M %p', al.changed_at, 'Asia/Kolkata') AS changed_at,
-        al.step_id,
-        sm.step_name,
-        al.old_status,
-        al.new_status,
-        al.changed_by,
-        al.delay_minutes,
-        al.exception_reason,
-        al.remarks
-      FROM \`${projectId}.CDSL_LOGS_NEW.step_audit_log\` al
-      LEFT JOIN \`${projectId}.CDSL_CONFIG.step_master\` sm
-        ON  al.process_code = sm.process_code
-        AND al.step_id      = sm.step_id
-      WHERE al.process_code = @processCode
-      ORDER BY al.changed_at DESC
-      LIMIT 100
-    `;
-    params = { processCode };
-  }
-
-  const [rows] = await bigquery.query({ query, location, params });
+  const query = stepId ? `
+    SELECT
+      FORMAT_TIMESTAMP('%d %b %Y %I:%M %p', al.changed_at, 'Asia/Kolkata') AS changed_at,
+      al.step_id,
+      sm.step_name,
+      al.old_status,
+      al.new_status,
+      al.changed_by,
+      al.delay_minutes,
+      al.exception_reason,
+      al.remarks
+    FROM \`${projectId}.CDSL_LOGS_NEW.step_audit_log\` al
+    LEFT JOIN \`${projectId}.${DATASET_CONFIG}.step_master\` sm
+      ON  al.process_code = sm.process_code
+      AND al.step_id      = sm.step_id
+    WHERE al.process_code = @processCode
+      AND al.step_id      = @stepId
+    ORDER BY al.changed_at DESC
+    LIMIT 100
+  ` : `
+    SELECT
+      FORMAT_TIMESTAMP('%d %b %Y %I:%M %p', al.changed_at, 'Asia/Kolkata') AS changed_at,
+      al.step_id,
+      sm.step_name,
+      al.old_status,
+      al.new_status,
+      al.changed_by,
+      al.delay_minutes,
+      al.exception_reason,
+      al.remarks
+    FROM \`${projectId}.CDSL_LOGS_NEW.step_audit_log\` al
+    LEFT JOIN \`${projectId}.${DATASET_CONFIG}.step_master\` sm
+      ON  al.process_code = sm.process_code
+      AND al.step_id      = sm.step_id
+    WHERE al.process_code = @processCode
+    ORDER BY al.changed_at DESC
+    LIMIT 100
+  `;
+  const params = stepId ? { processCode, stepId } : { processCode };
+  // Audit log join — fastQuery
+  const [rows] = await fastQuery({ query, location, params });
   return rows;
 }
 
-// ── Live buddy lookup from HRMantra (US region) ───────────────────────────────
+// ── Buddy lookup — local asia-south1 with in-memory cache ─────────────────────
 async function getLiveBuddyData(ownerEmails) {
   if (!ownerEmails || ownerEmails.length === 0) return {};
 
-  const emailList = ownerEmails
-    .map(e => `'${e.toLowerCase()}'`)
-    .join(",");
+  const now        = Date.now();
+  const cacheValid = (now - cache.buddy.ts) < cache.buddy.TTL;
+  const allCached  = cacheValid && ownerEmails.every(
+    e => cache.buddy.data[e.toLowerCase()] !== undefined
+  );
 
-  const query = `
-    SELECT
-      LOWER(OffEmailLower)              AS owner_email,
-      Department                        AS department,
-      EmpAttendance                     AS emp_attendance,
-      EmpLeaveFlag                      AS emp_leave_flag,
-      ShiftInActual                     AS emp_shift_in_actual,
-      ShiftInBarrier                    AS emp_shift_in_barrier,
-      LOWER(BuddyOffEmailLower)         AS buddy_email,
-      BuddyAttendance                   AS buddy_attendance,
-      LOWER(ReportingOffEmailLower)     AS reporting_email,
-      ReportingAttendance               AS reporting_attendance,
-      LOWER(FinalEmail)                 AS final_email
-    FROM \`universal-table-store\`.BuddySystem.BuddyMasterAutoPopulate
-    WHERE LOWER(OffEmailLower) IN (${emailList})
-  `;
+  if (!allCached) {
+    const toFetch = cacheValid
+      ? ownerEmails.filter(e => cache.buddy.data[e.toLowerCase()] === undefined)
+      : ownerEmails;
 
-  const [rows] = await bigquery.query({
-    query,
-    location: "US",
-  });
+    if (toFetch.length > 0) {
+      const emailList = toFetch.map(e => `'${e.toLowerCase()}'`).join(",");
+
+      // Small lookup — directQuery (no job overhead, much faster)
+      const [rows] = await directQuery({
+        query : `
+          SELECT
+            LOWER(owner_email)   AS owner_email,
+            emp_attendance,
+            emp_leave_flag,
+            buddy_email,
+            buddy_attendance,
+            reporting_email,
+            reporting_attendance,
+            final_email,
+            department
+          FROM \`${projectId}.${DATASET_CONFIG}.buddy_master\`
+          WHERE LOWER(owner_email) IN (${emailList})
+        `,
+        location,
+      });
+
+      rows.forEach(r => { cache.buddy.data[r.owner_email] = r; });
+      toFetch.forEach(e => {
+        if (cache.buddy.data[e.toLowerCase()] === undefined) {
+          cache.buddy.data[e.toLowerCase()] = null;
+        }
+      });
+      cache.buddy.ts = now;
+    }
+  }
 
   const map = {};
-  rows.forEach(r => { map[r.owner_email] = r; });
+  ownerEmails.forEach(e => {
+    const key = e.toLowerCase();
+    if (cache.buddy.data[key]) map[key] = cache.buddy.data[key];
+  });
   return map;
 }
 
-
-
-// ── Check if person is present based on attendance + time ─────────────────────
+// ── Check if person is present ────────────────────────────────────────────────
 function isPersonPresent(attendance, leaveFlag, shiftInActual, shiftInBarrier) {
   if (!attendance || attendance !== 1) return false;
-
   const flag = (leaveFlag || "").toUpperCase().trim();
-
   if (flag === "NOT IN" || flag === "") return false;
-
   if (flag === "IN" || flag === "LEFT EARLY") return true;
-
-  if (
-    flag === "LATE IN" ||
-    flag === "LATE MORE THAN 30 MINUTES"
-  ) {
-    if (!shiftInActual) return false;
+  if (flag === "LATE IN" || flag === "LATE MORE THAN 30 MINUTES") {
+    if (!shiftInActual)  return false;
     if (!shiftInBarrier) return true;
-
-    // Handle BigQuery timestamp objects { value: "2026-06-02T09:04:12" }
-    // and plain strings both
     const toDate = (v) => {
       if (!v) return null;
       if (typeof v === "object" && v.value) return new Date(v.value);
       return new Date(v);
     };
-
     const actual  = toDate(shiftInActual);
     const barrier = toDate(shiftInBarrier);
-
-    if (!actual || isNaN(actual.getTime()))  return false;
+    if (!actual  || isNaN(actual.getTime()))  return false;
     if (!barrier || isNaN(barrier.getTime())) return true;
-
-    // 30 min cooloff after barrier
     const cooloff = new Date(barrier.getTime() + 30 * 60 * 1000);
-
     return actual <= cooloff;
   }
-
-  // Any other flag with attendance=1 → present
   return true;
 }
 
-async function initProcessDay(processCode, processDate) {
-  const dateToInit = processDate || getTodayIST();
-
-  // Check if today is a working day
-  const [y, m, d]   = dateToInit.split("-");
-  const slashFormat = `${d}/${m}/${y}`;
-
-  const calQuery = `
-    SELECT COUNT(*) AS matched
-    FROM \`${projectId}.CDSL_CONFIG.trading_calendar\`
-    WHERE dd_mm_yyyy_slash = @dateSlash
-  `;
-
-  const [calRows] = await bigquery.query({
-    query    : calQuery,
-    location,
-    params   : { dateSlash: slashFormat },
-  });
-
-  const isWorking = (calRows[0]?.matched || 0) > 0;
-
-  if (!isWorking) {
-    return {
-      process_code : processCode,
-      process_date : dateToInit,
-      is_working   : false,
-      message      : `Skipped — ${dateToInit} is not a working day`,
-    };
-  }
-
-  // Working day — proceed with init
-  const query = `
-    CALL \`${projectId}.${DATASET_RUNTIME}.sp_init_process_day\`(
-      @processCode,
-      @processDate
-    )
-  `;
-
-  await bigquery.query({
-    query,
-    location,
-    params: {
-      processCode,
-      processDate: bigquery.date(dateToInit),
-    },
-  });
-
-  return {
-    process_code : processCode,
-    process_date : dateToInit,
-    is_working   : true,
-    message      : `Initialized process day for ${processCode} on ${dateToInit}`,
-  };
-}
-// ── Resolve assignment from buddy data ────────────────────────────────────────
+// ── Resolve assignment ────────────────────────────────────────────────────────
 function resolveAssignment(stepStatus, updatedBy, buddyData) {
   const status = (stepStatus || "").toUpperCase().trim();
 
   if (status === "COMPLETED" || status === "EXCEPTION") {
-    return {
-      assigned_email  : updatedBy || null,
-      assignment_type : "COMPLETED_BY",
-    };
+    return { assigned_email: updatedBy || null, assignment_type: "COMPLETED_BY" };
   }
 
   if (status === "PENDING") {
     if (!buddyData) {
-      return {
-        assigned_email  : "systems@geplcapital.com",
-        assignment_type : "ADMIN",
-      };
+      return { assigned_email: "systems@geplcapital.com", assignment_type: "ADMIN" };
     }
-
-    // Check owner presence with time logic
     const ownerPresent = isPersonPresent(
       buddyData.emp_attendance,
       buddyData.emp_leave_flag,
       buddyData.emp_shift_in_actual,
       buddyData.emp_shift_in_barrier
     );
-
     if (ownerPresent) {
-      return {
-        assigned_email  : buddyData.owner_email,
-        assignment_type : "SELF",
-      };
+      return { assigned_email: buddyData.owner_email, assignment_type: "SELF" };
     }
-
-    // Check buddy
     if (buddyData.buddy_attendance === 1 && buddyData.buddy_email) {
-      return {
-        assigned_email  : buddyData.buddy_email,
-        assignment_type : "BUDDY",
-      };
+      return { assigned_email: buddyData.buddy_email, assignment_type: "BUDDY" };
     }
-
-    // Check reporting manager
     if (buddyData.reporting_attendance === 1 && buddyData.reporting_email) {
-      return {
-        assigned_email  : buddyData.reporting_email,
-        assignment_type : "REPORTING",
-      };
+      return { assigned_email: buddyData.reporting_email, assignment_type: "REPORTING" };
     }
-
-    // Fallback
-    return {
-      assigned_email  : "systems@geplcapital.com",
-      assignment_type : "ADMIN",
-    };
+    return { assigned_email: "systems@geplcapital.com", assignment_type: "ADMIN" };
   }
 
   return { assigned_email: null, assignment_type: null };
@@ -428,14 +403,13 @@ function resolveAssignment(stepStatus, updatedBy, buddyData) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 async function getLatestProcessDate(processCode) {
-  const query = `
-    SELECT FORMAT_DATE('%Y-%m-%d', MAX(process_date)) AS process_date
-    FROM \`${projectId}.${DATASET_RUNTIME}.process_tracker\`
-    WHERE process_code = @processCode
-  `;
-
-  const [rows] = await bigquery.query({
-    query,
+  // Small lookup — directQuery
+  const [rows] = await directQuery({
+    query : `
+      SELECT FORMAT_DATE('%Y-%m-%d', MAX(process_date)) AS process_date
+      FROM \`${projectId}.${DATASET_RUNTIME}.process_tracker\`
+      WHERE process_code = @processCode
+    `,
     location,
     params: { processCode },
   });
@@ -445,24 +419,21 @@ async function getLatestProcessDate(processCode) {
     err.statusCode = 404;
     throw err;
   }
-
   return rows[0].process_date;
 }
 
 function getTodayIST() {
-  return new Date().toLocaleDateString("en-CA", {
-    timeZone: "Asia/Kolkata",
-  });
+  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 }
 
 function buildProcessResponse(processCode, steps) {
   return {
     source          : "BIGQUERY",
     process_code    : processCode,
-    process_name    : steps[0]?.process_name  || processCode,
-    process_slug    : steps[0]?.process_slug  || "",
-    module          : steps[0]?.module        || "",
-    process_date    : steps[0]?.process_date  || null,
+    process_name    : steps[0]?.process_name || processCode,
+    process_slug    : steps[0]?.process_slug || "",
+    module          : steps[0]?.module       || "",
+    process_date    : steps[0]?.process_date || null,
     total_steps     : steps.length,
     completed_steps : steps.filter(s => s.completed === "YES").length,
     steps,
@@ -471,6 +442,7 @@ function buildProcessResponse(processCode, steps) {
 
 // ── Exports ───────────────────────────────────────────────────────────────────
 module.exports = {
+  getProcesses,
   getProcessSteps,
   getProcessStep,
   initProcessDay,
