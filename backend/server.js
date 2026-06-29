@@ -1,35 +1,94 @@
-const dotenv = require("dotenv");
-dotenv.config();
+'use strict';
 
-const express = require("express");
-const cors = require("cors");
+const path = require('node:path');
+const { performance } = require('node:perf_hooks');
+const dotenv = require('dotenv');
 
-const processRoutes = require("./routes/processRoutes");
-const errorHandler  = require("./middleware/errorHandler");
+dotenv.config({
+  path: path.resolve(__dirname, '.env'),
+  override: false,
+});
 
-const app  = express();
-const PORT = process.env.PORT || 5000;
+const express = require('express');
+const cors = require('cors');
 
-app.use(cors());
-app.use(express.json());
+const processRoutes = require('./routes/processRoutes');
+const processService = require('./services/processService');
+const cacheService = require('./services/cacheService');
+const { closeRedis } = require('./config/redis');
+const errorHandler = require('./middleware/errorHandler');
 
-app.get("/", (req, res) => {
+const app = express();
+const PORT = Number.parseInt(process.env.PORT || '5001', 10);
+
+function getTimestampIST() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date());
+
+  const values = Object.fromEntries(
+    parts
+      .filter((part) => part.type !== 'literal')
+      .map((part) => [part.type, part.value]),
+  );
+
+  return `${values.year}-${values.month}-${values.day}T${values.hour}:${values.minute}:${values.second}+05:30`;
+}
+
+const configuredOrigins = String(process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.disable('x-powered-by');
+app.use(cors({
+  origin: configuredOrigins.length > 0 ? configuredOrigins : true,
+}));
+app.use(express.json({ limit: '1mb' }));
+
+app.use((req, res, next) => {
+  const startedAt = performance.now();
+
+  res.on('finish', () => {
+    const durationMs = Math.round(performance.now() - startedAt);
+    console.log(
+      `[http] ${req.method} ${req.originalUrl} ${res.statusCode} ${durationMs}ms`,
+    );
+  });
+
+  next();
+});
+
+app.get('/', (_req, res) => {
   res.json({
     success: true,
-    message: "CDSL backend is running",
+    message: 'CDSL backend is running',
+    timestamp_ist: getTimestampIST(),
   });
 });
 
-app.get("/health", (req, res) => {
+function statusHandler(_req, res) {
+  res.set('Cache-Control', 'no-store');
   res.json({
-    success: true,
-    service: "CDSL Backend",
-    status: "OK",
-    timestamp: new Date().toISOString(),
+    status: 'ok',
+    service: 'CDSL Backend',
+    timestamp_ist: getTimestampIST(),
+    cache: cacheService.getCacheInfo(),
   });
-});
+}
 
-app.use("/api/process", processRoutes);
+// /status is retained as a compatibility endpoint for any stale frontend build.
+app.get('/status', statusHandler);
+app.get('/health', statusHandler);
+
+app.use('/api/process', processRoutes);
 
 app.use((req, res) => {
   res.status(404).json({
@@ -40,6 +99,49 @@ app.use((req, res) => {
 
 app.use(errorHandler);
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`CDSL backend running on http://localhost:${PORT}`);
+
+  const processCodes = String(process.env.CACHE_WARM_PROCESS_CODES || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  if (processCodes.length > 0) {
+    setImmediate(async () => {
+      for (const processCode of processCodes) {
+        try {
+          const result = await processService.getProcessSteps(processCode);
+          console.log(
+            `[warmup] ${processCode} ready from ${result.source || 'unknown'}`,
+          );
+        } catch (error) {
+          console.warn(`[warmup] ${processCode} failed:`, error.message);
+        }
+      }
+    });
+  }
 });
+
+let shuttingDown = false;
+
+async function shutdown(signal) {
+  if (shuttingDown) {
+    return;
+  }
+
+  shuttingDown = true;
+  console.log(`[shutdown] received ${signal}`);
+
+  server.close(async () => {
+    await closeRedis();
+    process.exit(0);
+  });
+
+  setTimeout(() => process.exit(1), 10000).unref();
+}
+
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
+
+module.exports = { app, server };
