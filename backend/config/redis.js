@@ -56,6 +56,7 @@ async function closeRedis() {
 
   try {
     await redis.quit();
+  // eslint-disable-next-line no-unused-vars
   } catch (_error) {
     redis.disconnect(false);
   }
