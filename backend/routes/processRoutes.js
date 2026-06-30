@@ -22,3 +22,4 @@ router.post("/:processCode/archive", ctrl.archiveProcessDay);
 router.patch("/:processCode/steps/:stepId/status", ctrl.updateStepStatus);
 
 module.exports = router;
+

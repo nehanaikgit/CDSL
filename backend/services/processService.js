@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 const { performance } = require('node:perf_hooks');
 const {
@@ -10,57 +10,40 @@ const {
 } = require('../config/bigQueryClient');
 const cacheService = require('./cacheService');
 
-const DATASET_RUNTIME = process.env.BQ_DATASET_RUNTIME || 'CDSL_RUNTIME';
-const DATASET_CONFIG = process.env.BQ_DATASET_CONFIG || 'CDSL_CONFIG';
-const DATASET_LOGS = process.env.BQ_DATASET_LOGS || 'CDSL_LOGS_NEW';
-const ADMIN_EMAIL = String(process.env.CDSL_ADMIN_EMAIL || '')
-  .trim()
-  .toLowerCase();
+const DATASET_RUNTIME  = process.env.BQ_DATASET_RUNTIME  || 'CDSL_RUNTIME';
+const DATASET_CONFIG   = process.env.BQ_DATASET_CONFIG   || 'CDSL_CONFIG';
+const DATASET_LOGS     = process.env.BQ_DATASET_LOGS     || 'CDSL_LOGS_NEW';
+const ADMIN_EMAIL      = String(process.env.CDSL_ADMIN_EMAIL || '').trim().toLowerCase();
 
 const inFlightStepLoads = new Map();
 
+// ── Date helpers ──────────────────────────────────────────────────────────────
 function getTodayIST() {
-  return new Date().toLocaleDateString('en-CA', {
-    timeZone: 'Asia/Kolkata',
-  });
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 }
 
 function getYesterdayIST() {
-  const now = new Date();
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Kolkata',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).formatToParts(now);
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date());
 
   const values = Object.fromEntries(
-    parts
-      .filter((part) => part.type !== 'literal')
-      .map((part) => [part.type, part.value]),
+    parts.filter(p => p.type !== 'literal').map(p => [p.type, p.value])
   );
 
-  const date = new Date(
-    Date.UTC(
-      Number(values.year),
-      Number(values.month) - 1,
-      Number(values.day),
-    ),
-  );
-
+  const date = new Date(Date.UTC(Number(values.year), Number(values.month) - 1, Number(values.day)));
   date.setUTCDate(date.getUTCDate() - 1);
   return date.toISOString().slice(0, 10);
 }
 
 function normalizeProcessCode(processCode) {
   const normalized = String(processCode || '').trim().toUpperCase();
-
   if (!normalized) {
     const error = new Error('processCode is required');
     error.statusCode = 400;
     throw error;
   }
-
   return normalized;
 }
 
@@ -73,38 +56,36 @@ function withSource(data, source, startedAt, extra = {}) {
   };
 }
 
+// ── Get all active processes ──────────────────────────────────────────────────
 async function getProcesses() {
   const cached = await cacheService.getProcessList();
-  if (cached !== null) {
-    return cached;
-  }
+  if (cached !== null) return cached;
 
-  const query = `
-    SELECT
-      process_code,
-      process_name,
-      process_slug,
-      module,
-      planned_time,
-      working_days,
-      is_active
-    FROM \`${projectId}.${DATASET_CONFIG}.process_master\`
-    WHERE is_active = TRUE
-    ORDER BY module, planned_time, process_name
-  `;
+  const [rows] = await directQuery({
+    query: `
+      SELECT
+        process_code, process_name, process_slug,
+module,
+FORMAT_TIME('%H:%M:%S', planned_time_value) AS planned_time,
+working_days,
+is_active      FROM \`${projectId}.${DATASET_CONFIG}.process_master\`
+      WHERE is_active = TRUE
+ORDER BY module, planned_time_value, process_name    `,
+    location,
+  });
 
-  const [rows] = await directQuery({ query, location });
   await cacheService.setProcessList(rows);
   return rows;
 }
 
+// ── Load steps from BQ — full join with buddy data ───────────────────────────
 async function loadProcessStepsFromBigQuery(processCode, processDate) {
   const query = `
     SELECT
       pt.tracker_id,
-      FORMAT_DATE('%Y-%m-%d', pt.process_date) AS process_date,
+      FORMAT_DATE('%Y-%m-%d', pt.process_date)              AS process_date,
       pt.process_code,
-      COALESCE(pt.process_slug, pm.process_slug) AS process_slug,
+      COALESCE(pt.process_slug, pm.process_slug)            AS process_slug,
       pm.process_name,
       pm.module,
       pt.step_id,
@@ -134,27 +115,21 @@ async function loadProcessStepsFromBigQuery(processCode, processDate) {
       pt.completed,
       pt.exception_reason,
       pt.last_status_value,
-      COALESCE(pt.planned_time, pm.planned_time) AS planned_time,
-
+COALESCE(
+  pt.planned_time,
+  FORMAT_TIME('%H:%M:%S', pm.planned_time_value)
+) AS planned_time,
       CASE
         WHEN pt.actual_time IS NULL THEN NULL
-        ELSE FORMAT_TIMESTAMP(
-          '%d %b %Y %I:%M %p',
-          pt.actual_time,
-          'Asia/Kolkata'
-        )
+        ELSE FORMAT_TIMESTAMP('%d %b %Y %I:%M %p', pt.actual_time, 'Asia/Kolkata')
       END AS actual_time,
 
-      IFNULL(pt.delay_minutes, 0) AS delay_minutes,
+      IFNULL(pt.delay_minutes, 0)                           AS delay_minutes,
       pt.updated_by,
 
       CASE
         WHEN pt.updated_at IS NULL THEN NULL
-        ELSE FORMAT_TIMESTAMP(
-          '%d %b %Y %I:%M %p',
-          pt.updated_at,
-          'Asia/Kolkata'
-        )
+        ELSE FORMAT_TIMESTAMP('%d %b %Y %I:%M %p', pt.updated_at, 'Asia/Kolkata')
       END AS updated_at,
 
       sm.owner_role,
@@ -169,26 +144,31 @@ async function loadProcessStepsFromBigQuery(processCode, processDate) {
       sm.dependency_ids,
       sm.allowed_statuses,
       sm.remarks,
+
       COALESCE(exception_config.exception_statuses, ARRAY<STRING>[]) AS exception_statuses,
 
-      buddy.owner_email AS buddy_owner_email,
-      buddy.emp_attendance AS buddy_emp_attendance,
-      buddy.emp_leave_flag AS buddy_emp_leave_flag,
-      buddy.buddy_email AS buddy_email,
-      buddy.buddy_attendance AS buddy_attendance,
-      buddy.reporting_email AS buddy_reporting_email,
-      buddy.reporting_attendance AS buddy_reporting_attendance
+      -- Buddy fields — all attendance columns + leave flags
+      buddy.owner_email           AS buddy_owner_email,
+      buddy.emp_attendance        AS buddy_emp_attendance,
+      buddy.emp_leave_flag        AS buddy_emp_leave_flag,
+      buddy.buddy_email           AS buddy_email,
+      buddy.buddy_attendance      AS buddy_attendance,
+      buddy.buddy_leave_flag      AS buddy_leave_flag,
+      buddy.reporting_email       AS buddy_reporting_email,
+      buddy.reporting_attendance  AS buddy_reporting_attendance,
+      buddy.reporting_leave_flag  AS buddy_reporting_leave_flag,
+      buddy.final_email           AS buddy_final_email
 
     FROM \`${projectId}.${DATASET_RUNTIME}.process_tracker\` pt
 
     LEFT JOIN \`${projectId}.${DATASET_CONFIG}.step_master\` sm
-      ON sm.process_code = pt.process_code
-      AND sm.step_id = pt.step_id
-      AND sm.is_active = TRUE
+      ON  sm.process_code = pt.process_code
+      AND sm.step_id      = pt.step_id
+      AND sm.is_active    = TRUE
 
     LEFT JOIN \`${projectId}.${DATASET_CONFIG}.process_master\` pm
-      ON pm.process_code = pt.process_code
-      AND pm.is_active = TRUE
+      ON  pm.process_code = pt.process_code
+      AND pm.is_active    = TRUE
 
     LEFT JOIN (
       SELECT
@@ -196,22 +176,25 @@ async function loadProcessStepsFromBigQuery(processCode, processDate) {
         ARRAY_AGG(status_value ORDER BY sort_order) AS exception_statuses
       FROM \`${projectId}.${DATASET_CONFIG}.allowed_statuses\`
       WHERE requires_remark = TRUE
-        AND is_active = TRUE
-        AND process_code = @processCode
+        AND is_active       = TRUE
+        AND process_code    = @processCode
       GROUP BY process_code
     ) AS exception_config
       ON exception_config.process_code = pt.process_code
 
     LEFT JOIN (
       SELECT
-        LOWER(owner_email) AS owner_key,
-        ANY_VALUE(owner_email) AS owner_email,
-        ANY_VALUE(emp_attendance) AS emp_attendance,
-        ANY_VALUE(emp_leave_flag) AS emp_leave_flag,
-        ANY_VALUE(buddy_email) AS buddy_email,
-        ANY_VALUE(buddy_attendance) AS buddy_attendance,
-        ANY_VALUE(reporting_email) AS reporting_email,
-        ANY_VALUE(reporting_attendance) AS reporting_attendance
+        LOWER(owner_email)                        AS owner_key,
+        ANY_VALUE(owner_email)                    AS owner_email,
+        ANY_VALUE(emp_attendance)                 AS emp_attendance,
+        ANY_VALUE(emp_leave_flag)                 AS emp_leave_flag,
+        ANY_VALUE(buddy_email)                    AS buddy_email,
+        ANY_VALUE(buddy_attendance)               AS buddy_attendance,
+        ANY_VALUE(buddy_leave_flag)               AS buddy_leave_flag,
+        ANY_VALUE(reporting_email)                AS reporting_email,
+        ANY_VALUE(reporting_attendance)           AS reporting_attendance,
+        ANY_VALUE(reporting_leave_flag)           AS reporting_leave_flag,
+        ANY_VALUE(final_email)                    AS final_email
       FROM \`${projectId}.${DATASET_CONFIG}.buddy_master\`
       WHERE owner_email IS NOT NULL
       GROUP BY owner_key
@@ -234,36 +217,38 @@ async function loadProcessStepsFromBigQuery(processCode, processDate) {
   });
 
   if (!rows.length) {
-    const error = new Error(
-      `No data for ${processCode} on ${processDate}. Run init first.`,
-    );
+    const error = new Error(`No data for ${processCode} on ${processDate}. Run init first.`);
     error.statusCode = 404;
     throw error;
   }
 
   const enrichedRows = rows.map((row) => {
     const {
-      buddy_owner_email: buddyOwnerEmail,
-      buddy_emp_attendance: employeeAttendance,
-      buddy_emp_leave_flag: employeeLeaveFlag,
-      buddy_email: buddyEmail,
-      buddy_attendance: buddyAttendance,
-      buddy_reporting_email: reportingEmail,
-      buddy_reporting_attendance: reportingAttendance,
+      buddy_owner_email       : buddyOwnerEmail,
+      buddy_emp_attendance    : empAttendance,
+      buddy_emp_leave_flag    : empLeaveFlag,
+      buddy_email             : buddyEmail,
+      buddy_attendance        : buddyAttendance,
+      buddy_leave_flag        : buddyLeaveFlag,
+      buddy_reporting_email   : reportingEmail,
+      buddy_reporting_attendance : reportingAttendance,
+      buddy_reporting_leave_flag : reportingLeaveFlag,
+      buddy_final_email       : finalEmail,
       ...publicRow
     } = row;
 
-    const buddyData = buddyOwnerEmail
-      ? {
-          owner_email: buddyOwnerEmail,
-          emp_attendance: employeeAttendance,
-          emp_leave_flag: employeeLeaveFlag,
-          buddy_email: buddyEmail,
-          buddy_attendance: buddyAttendance,
-          reporting_email: reportingEmail,
-          reporting_attendance: reportingAttendance,
-        }
-      : null;
+    const buddyData = buddyOwnerEmail ? {
+      owner_email          : buddyOwnerEmail,
+      emp_attendance       : empAttendance,
+      emp_leave_flag       : empLeaveFlag,
+      buddy_email          : buddyEmail,
+      buddy_attendance     : buddyAttendance,
+      buddy_leave_flag     : buddyLeaveFlag,
+      reporting_email      : reportingEmail,
+      reporting_attendance : reportingAttendance,
+      reporting_leave_flag : reportingLeaveFlag,
+      final_email          : finalEmail,
+    } : null;
 
     const assignment = resolveAssignment(
       row.step_status,
@@ -272,10 +257,7 @@ async function loadProcessStepsFromBigQuery(processCode, processDate) {
       buddyData,
     );
 
-    return {
-      ...publicRow,
-      ...assignment,
-    };
+    return { ...publicRow, ...assignment };
   });
 
   const result = buildProcessResponse(processCode, enrichedRows);
@@ -283,18 +265,14 @@ async function loadProcessStepsFromBigQuery(processCode, processDate) {
   return result;
 }
 
+// ── In-flight deduplication ───────────────────────────────────────────────────
 function getOrCreateStepLoad(processCode, processDate) {
   const loadKey = `${processCode}:${processDate}`;
   const existing = inFlightStepLoads.get(loadKey);
-
-  if (existing) {
-    return existing;
-  }
+  if (existing) return existing;
 
   const loadPromise = loadProcessStepsFromBigQuery(processCode, processDate)
-    .finally(() => {
-      inFlightStepLoads.delete(loadKey);
-    });
+    .finally(() => { inFlightStepLoads.delete(loadKey); });
 
   inFlightStepLoads.set(loadKey, loadPromise);
   return loadPromise;
@@ -302,105 +280,83 @@ function getOrCreateStepLoad(processCode, processDate) {
 
 function refreshStaleStepsInBackground(processCode, processDate) {
   void getOrCreateStepLoad(processCode, processDate)
-    .then(() => {
-      console.log(`[cache] background refresh completed for ${processCode}`);
-    })
-    .catch((error) => {
-      console.warn(
-        `[cache] background refresh failed for ${processCode}:`,
-        error.message,
-      );
-    });
+    .then(() => { console.log(`[cache] background refresh completed for ${processCode}`); })
+    .catch((err) => { console.warn(`[cache] background refresh failed for ${processCode}:`, err.message); });
 }
 
+// ── Get all steps (cached) ────────────────────────────────────────────────────
 async function getProcessSteps(rawProcessCode) {
-  const startedAt = performance.now();
+  const startedAt   = performance.now();
   const processCode = normalizeProcessCode(rawProcessCode);
   const processDate = getTodayIST();
-  const cached = await cacheService.getSteps(processCode, processDate);
+  const cached      = await cacheService.getSteps(processCode, processDate);
 
   if (cached.state === 'fresh') {
-    const result = withSource(cached.data, 'REDIS', startedAt, {
-      cache_state: 'fresh',
-    });
-    console.log(
-      `[process] ${processCode} source=REDIS duration=${result.response_time_ms}ms`,
-    );
+    const result = withSource(cached.data, 'REDIS', startedAt, { cache_state: 'fresh' });
+    console.log(`[process] ${processCode} source=REDIS duration=${result.response_time_ms}ms`);
     return result;
   }
 
   if (cached.state === 'stale') {
     refreshStaleStepsInBackground(processCode, processDate);
-    const result = withSource(cached.data, 'REDIS_STALE', startedAt, {
-      cache_state: 'stale',
-      refresh_in_progress: true,
-    });
-    console.log(
-      `[process] ${processCode} source=REDIS_STALE duration=${result.response_time_ms}ms`,
-    );
+    const result = withSource(cached.data, 'REDIS_STALE', startedAt, { cache_state: 'stale', refresh_in_progress: true });
+    console.log(`[process] ${processCode} source=REDIS_STALE duration=${result.response_time_ms}ms`);
     return result;
   }
 
   const hadExistingLoad = inFlightStepLoads.has(`${processCode}:${processDate}`);
-  const data = await getOrCreateStepLoad(processCode, processDate);
+  const data   = await getOrCreateStepLoad(processCode, processDate);
   const source = hadExistingLoad ? 'IN_FLIGHT' : 'BIGQUERY';
-  const result = withSource(data, source, startedAt, {
-    cache_state: 'miss',
-  });
-
-  console.log(
-    `[process] ${processCode} source=${source} duration=${result.response_time_ms}ms`,
-  );
+  const result = withSource(data, source, startedAt, { cache_state: 'miss' });
+  console.log(`[process] ${processCode} source=${source} duration=${result.response_time_ms}ms`);
   return result;
 }
 
+// ── Get single step (always fresh) ───────────────────────────────────────────
 async function getProcessStep(rawProcessCode, stepId) {
   const processCode = normalizeProcessCode(rawProcessCode);
   const processDate = getTodayIST();
 
-  const query = `
-    SELECT
-      pt.tracker_id,
-      FORMAT_DATE('%Y-%m-%d', pt.process_date) AS process_date,
-      pt.process_code,
-      pt.step_id,
-      pt.step_no,
-      sm.step_name,
-      pt.step_status,
-      pt.completed,
-      pt.exception_reason,
-      pt.last_status_value,
-      COALESCE(pt.planned_time, pm.planned_time) AS planned_time,
-      CASE
-        WHEN pt.actual_time IS NULL THEN NULL
-        ELSE FORMAT_TIMESTAMP(
-          '%d %b %Y %I:%M %p',
-          pt.actual_time,
-          'Asia/Kolkata'
-        )
-      END AS actual_time,
-      IFNULL(pt.delay_minutes, 0) AS delay_minutes,
-      pt.updated_by,
-      sm.owner_email,
-      sm.owner_role,
-      sm.allowed_statuses,
-      sm.dependency_ids
-    FROM \`${projectId}.${DATASET_RUNTIME}.process_tracker\` pt
-    LEFT JOIN \`${projectId}.${DATASET_CONFIG}.step_master\` sm
-      ON sm.process_code = pt.process_code
-      AND sm.step_id = pt.step_id
-      AND sm.is_active = TRUE
-    LEFT JOIN \`${projectId}.${DATASET_CONFIG}.process_master\` pm
-      ON pm.process_code = pt.process_code
-      AND pm.is_active = TRUE
-    WHERE pt.process_code = @processCode
-      AND pt.process_date = @processDate
-      AND pt.step_id = @stepId
-    LIMIT 1
-  `;
-
   const [rows] = await directQuery({
-    query,
+    query: `
+      SELECT
+        pt.tracker_id,
+        FORMAT_DATE('%Y-%m-%d', pt.process_date) AS process_date,
+        pt.process_code,
+        pt.step_id,
+        pt.step_no,
+        sm.step_name,
+        pt.step_status,
+        pt.completed,
+        pt.exception_reason,
+        pt.last_status_value,
+       COALESCE(
+  pt.planned_time,
+  FORMAT_TIME('%H:%M:%S', pm.planned_time_value)
+) AS planned_time,
+        CASE
+          WHEN pt.actual_time IS NULL THEN NULL
+          ELSE FORMAT_TIMESTAMP('%d %b %Y %I:%M %p', pt.actual_time, 'Asia/Kolkata')
+        END AS actual_time,
+        IFNULL(pt.delay_minutes, 0) AS delay_minutes,
+        pt.updated_by,
+        sm.owner_email,
+        sm.owner_role,
+        sm.allowed_statuses,
+        sm.dependency_ids
+      FROM \`${projectId}.${DATASET_RUNTIME}.process_tracker\` pt
+      LEFT JOIN \`${projectId}.${DATASET_CONFIG}.step_master\` sm
+        ON  sm.process_code = pt.process_code
+        AND sm.step_id      = pt.step_id
+        AND sm.is_active    = TRUE
+      LEFT JOIN \`${projectId}.${DATASET_CONFIG}.process_master\` pm
+        ON  pm.process_code = pt.process_code
+        AND pm.is_active    = TRUE
+      WHERE pt.process_code = @processCode
+        AND pt.process_date = @processDate
+        AND pt.step_id      = @stepId
+      LIMIT 1
+    `,
     location,
     params: {
       processCode,
@@ -418,44 +374,35 @@ async function getProcessStep(rawProcessCode, stepId) {
   return rows[0];
 }
 
-async function updateStepStatus(
-  rawProcessCode,
-  stepId,
-  newStatus,
-  changedBy,
-  remark = '',
-) {
-  const processCode = normalizeProcessCode(rawProcessCode);
-  const processDate = getTodayIST();
+// ── Mark step status ──────────────────────────────────────────────────────────
+async function updateStepStatus(rawProcessCode, stepId, newStatus, changedBy, remark = '') {
+  const processCode     = normalizeProcessCode(rawProcessCode);
+  const processDate     = getTodayIST();
   const normalizedStatus = String(newStatus || '').trim();
 
+  // Validate status against step_master.allowed_statuses
   const [validationRows] = await directQuery({
     query: `
       SELECT COUNT(*) AS cnt
       FROM \`${projectId}.${DATASET_CONFIG}.step_master\` sm,
       UNNEST(sm.allowed_statuses) AS allowed_status
       WHERE sm.process_code = @processCode
-        AND sm.step_id = @stepId
-        AND sm.is_active = TRUE
-        AND allowed_status = @newStatus
+        AND sm.step_id      = @stepId
+        AND sm.is_active    = TRUE
+        AND allowed_status  = @newStatus
     `,
     location,
-    params: {
-      processCode,
-      stepId,
-      newStatus: normalizedStatus,
-    },
+    params: { processCode, stepId, newStatus: normalizedStatus },
   });
 
   const isPending = normalizedStatus.toUpperCase() === 'PENDING';
   if (!isPending && Number(validationRows[0]?.cnt || 0) === 0) {
-    const error = new Error(
-      `Invalid status "${normalizedStatus}" for step "${stepId}" in process "${processCode}"`,
-    );
+    const error = new Error(`Invalid status "${normalizedStatus}" for step "${stepId}" in process "${processCode}"`);
     error.statusCode = 400;
     throw error;
   }
 
+  // Call stored procedure
   await fastQuery({
     query: `
       CALL \`${projectId}.${DATASET_RUNTIME}.sp_mark_step_status\`(
@@ -469,67 +416,65 @@ async function updateStepStatus(
     `,
     location,
     params: {
-      processDate: bigquery.date(processDate),
+      processDate : bigquery.date(processDate),
       processCode,
       stepId,
-      newStatus: normalizedStatus,
-      changedBy: String(changedBy || 'SYSTEM').trim(),
-      remark: String(remark || '').trim(),
+      newStatus   : normalizedStatus,
+      changedBy   : String(changedBy || 'SYSTEM').trim(),
+      remark      : String(remark || '').trim(),
     },
   });
 
+  // Bust cache immediately
   await cacheService.bustProcess(processCode, processDate);
 
   return {
     process_code: processCode,
     process_date: processDate,
-    step_id: stepId,
-    new_status: normalizedStatus,
-    changed_by: changedBy || 'SYSTEM',
-    message: `Step ${stepId} updated to "${normalizedStatus}"`,
+    step_id     : stepId,
+    new_status  : normalizedStatus,
+    changed_by  : changedBy || 'SYSTEM',
+    message     : `Step ${stepId} updated to "${normalizedStatus}"`,
   };
 }
 
+// ── Init process day ──────────────────────────────────────────────────────────
 async function initProcessDay(rawProcessCode, processDate) {
   const processCode = normalizeProcessCode(rawProcessCode);
   const dateToInit = processDate || getTodayIST();
-  const [year, month, day] = dateToInit.split('-');
-  const slashFormat = `${day}/${month}/${year}`;
 
+  // Use the same authoritative working-day function as the stored procedures.
   const [calendarRows] = await directQuery({
     query: `
-      SELECT COUNT(*) AS matched
-      FROM \`${projectId}.${DATASET_CONFIG}.trading_calendar\`
-      WHERE dd_mm_yyyy_slash = @dateSlash
+      SELECT
+        \`${projectId}.${DATASET_CONFIG}.fx_is_working_day\`(
+          @processDate
+        ) AS is_working
     `,
     location,
     params: {
-      dateSlash: slashFormat,
+      processDate: bigquery.date(dateToInit),
     },
   });
 
-  const isWorking = Number(calendarRows[0]?.matched || 0) > 0;
+  const isWorking = calendarRows[0]?.is_working === true;
   if (!isWorking) {
     return {
       process_code: processCode,
       process_date: dateToInit,
-      is_working: false,
-      message: `Skipped — ${dateToInit} is not a working day`,
+      is_working  : false,
+      message     : `Skipped — ${dateToInit} is not a working day`,
     };
   }
 
   await fastQuery({
     query: `
       CALL \`${projectId}.${DATASET_RUNTIME}.sp_init_process_day\`(
-        @processDate,
-        @processCode
+        @processDate, @processCode
       )
     `,
     location,
-    params: {
-      processDate: bigquery.date(dateToInit),
-      processCode,
-    },
+    params: { processDate: bigquery.date(dateToInit), processCode },
   });
 
   await cacheService.bustProcess(processCode, dateToInit);
@@ -537,30 +482,26 @@ async function initProcessDay(rawProcessCode, processDate) {
   return {
     process_code: processCode,
     process_date: dateToInit,
-    is_working: true,
-    message: `Initialized ${processCode} for ${dateToInit}`,
+    is_working  : true,
+    message     : `Initialized ${processCode} for ${dateToInit}`,
   };
 }
 
+// ── Archive process day ───────────────────────────────────────────────────────
 async function archiveProcessDay(rawProcessCode, processDate) {
-  const processCode = normalizeProcessCode(rawProcessCode);
-  const dateToArchive =
-    !processDate || processDate === 'yesterday'
-      ? getYesterdayIST()
-      : processDate;
+  const processCode  = normalizeProcessCode(rawProcessCode);
+  const dateToArchive = (!processDate || processDate === 'yesterday')
+    ? getYesterdayIST()
+    : processDate;
 
   await fastQuery({
     query: `
       CALL \`${projectId}.${DATASET_RUNTIME}.sp_archive_process_day\`(
-        @processDate,
-        @processCode
+        @processDate, @processCode
       )
     `,
     location,
-    params: {
-      processDate: bigquery.date(dateToArchive),
-      processCode,
-    },
+    params: { processDate: bigquery.date(dateToArchive), processCode },
   });
 
   await cacheService.bustProcess(processCode, dateToArchive);
@@ -568,55 +509,47 @@ async function archiveProcessDay(rawProcessCode, processDate) {
   return {
     process_code: processCode,
     process_date: dateToArchive,
-    message: `Archived ${processCode} for ${dateToArchive}`,
+    message     : `Archived ${processCode} for ${dateToArchive}`,
   };
 }
 
+// ── Audit log ─────────────────────────────────────────────────────────────────
 async function getAuditLog(rawProcessCode, stepId = null) {
   const processCode = normalizeProcessCode(rawProcessCode);
-  const query = `
-    SELECT
-      FORMAT_TIMESTAMP(
-        '%d %b %Y %I:%M %p',
-        al.changed_at,
-        'Asia/Kolkata'
-      ) AS changed_at,
-      al.step_id,
-      sm.step_name,
-      al.old_status,
-      al.new_status,
-      al.changed_by,
-      al.delay_minutes,
-      al.exception_reason,
-      al.remarks
-    FROM \`${projectId}.${DATASET_LOGS}.step_audit_log\` al
-    LEFT JOIN \`${projectId}.${DATASET_CONFIG}.step_master\` sm
-      ON sm.process_code = al.process_code
-      AND sm.step_id = al.step_id
-    WHERE al.process_code = @processCode
-      ${stepId ? 'AND al.step_id = @stepId' : ''}
-    ORDER BY al.changed_at DESC
-    LIMIT 100
-  `;
-
-  const params = stepId
-    ? { processCode, stepId }
-    : { processCode };
 
   const [rows] = await fastQuery({
-    query,
+    query: `
+      SELECT
+        FORMAT_TIMESTAMP('%d %b %Y %I:%M %p', al.changed_at, 'Asia/Kolkata') AS changed_at,
+        al.step_id,
+        sm.step_name,
+        al.old_status,
+        al.new_status,
+        al.changed_by,
+        al.delay_minutes,
+        al.exception_reason,
+        al.remarks
+      FROM \`${projectId}.${DATASET_LOGS}.step_audit_log\` al
+      LEFT JOIN \`${projectId}.${DATASET_CONFIG}.step_master\` sm
+        ON  sm.process_code = al.process_code
+        AND sm.step_id      = al.step_id
+      WHERE al.process_code = @processCode
+        ${stepId ? 'AND al.step_id = @stepId' : ''}
+      ORDER BY al.changed_at DESC
+      LIMIT 100
+    `,
     location,
-    params,
+    params: stepId ? { processCode, stepId } : { processCode },
   });
 
   return rows;
 }
 
+// ── Buddy resolution ──────────────────────────────────────────────────────────
+// emp_attendance is INT64 in buddy_master (1=Present, 0=Absent)
+// Also handles STRING 'Present'/'Absent' for backward compat
 function isPresent(attendance) {
-  if (attendance === true || attendance === 1) {
-    return true;
-  }
-
+  if (attendance === true || attendance === 1) return true;
   const value = String(attendance || '').trim().toLowerCase();
   return ['1', 'present', 'yes', 'y', 'in'].includes(value);
 }
@@ -628,12 +561,8 @@ function isOnLeave(leaveFlag) {
 
 function fallbackAssignment(ownerEmail) {
   if (ADMIN_EMAIL) {
-    return {
-      assigned_email: ADMIN_EMAIL,
-      assignment_type: 'ADMIN',
-    };
+    return { assigned_email: ADMIN_EMAIL, assignment_type: 'ADMIN' };
   }
-
   return {
     assigned_email: ownerEmail || null,
     assignment_type: ownerEmail ? 'OWNER_FALLBACK' : 'UNASSIGNED',
@@ -643,71 +572,65 @@ function fallbackAssignment(ownerEmail) {
 function resolveAssignment(stepStatus, updatedBy, ownerEmail, buddyData) {
   const status = String(stepStatus || '').toUpperCase().trim();
 
+  // Completed or exception — show who did it
   if (status === 'COMPLETED' || status === 'EXCEPTION') {
-    return {
-      assigned_email: updatedBy || null,
-      assignment_type: 'COMPLETED_BY',
-    };
+    return { assigned_email: updatedBy || null, assignment_type: 'COMPLETED_BY' };
   }
 
   if (status !== 'PENDING') {
-    return {
-      assigned_email: null,
-      assignment_type: null,
-    };
+    return { assigned_email: null, assignment_type: null };
   }
 
-  if (!buddyData) {
-    return fallbackAssignment(ownerEmail);
-  }
+  if (!buddyData) return fallbackAssignment(ownerEmail);
 
-  if (
-    isPresent(buddyData.emp_attendance) &&
-    !isOnLeave(buddyData.emp_leave_flag)
-  ) {
+  // SELF — owner is present and not on leave
+  if (isPresent(buddyData.emp_attendance) && !isOnLeave(buddyData.emp_leave_flag)) {
     return {
       assigned_email: buddyData.owner_email || ownerEmail || null,
       assignment_type: 'SELF',
     };
   }
 
-  if (isPresent(buddyData.buddy_attendance) && buddyData.buddy_email) {
-    return {
-      assigned_email: buddyData.buddy_email,
-      assignment_type: 'BUDDY',
-    };
+  // BUDDY — buddy is present and not on leave
+  if (
+    isPresent(buddyData.buddy_attendance) &&
+    !isOnLeave(buddyData.buddy_leave_flag) &&
+    buddyData.buddy_email
+  ) {
+    return { assigned_email: buddyData.buddy_email, assignment_type: 'BUDDY' };
   }
 
+  // REPORTING — reporting manager is present and not on leave
   if (
     isPresent(buddyData.reporting_attendance) &&
+    !isOnLeave(buddyData.reporting_leave_flag) &&
     buddyData.reporting_email
   ) {
-    return {
-      assigned_email: buddyData.reporting_email,
-      assignment_type: 'REPORTING',
-    };
+    return { assigned_email: buddyData.reporting_email, assignment_type: 'REPORTING' };
   }
 
+  // ADMIN fallback
   return fallbackAssignment(ownerEmail);
 }
 
+// ── Build response shape ──────────────────────────────────────────────────────
 function buildProcessResponse(processCode, steps) {
   return {
-    process_code: processCode,
-    process_name: steps[0]?.process_name || processCode,
-    process_slug: steps[0]?.process_slug || '',
-    module: steps[0]?.module || '',
-    process_date: steps[0]?.process_date || null,
-    total_steps: steps.length,
-    completed_steps: steps.filter(
-      (step) =>
-        String(step.completed || '').toUpperCase() === 'YES' ||
-        String(step.step_status || '').toUpperCase() === 'COMPLETED',
+    process_code   : processCode,
+    process_name   : steps[0]?.process_name || processCode,
+    process_slug   : steps[0]?.process_slug || '',
+    module         : steps[0]?.module || '',
+    process_date   : steps[0]?.process_date || null,
+    total_steps    : steps.length,
+    completed_steps: steps.filter(step =>
+      String(step.completed || '').toUpperCase() === 'YES' ||
+      String(step.step_status || '').toUpperCase() === 'COMPLETED'
     ).length,
     steps,
   };
 }
 
+// ── Exports ───────────────────────────────────────────────────────────────────
 module.exports = {
   getProcesses,
   getProcessSteps,

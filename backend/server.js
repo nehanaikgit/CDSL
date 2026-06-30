@@ -13,6 +13,8 @@ const express = require('express');
 const cors = require('cors');
 
 const processRoutes = require('./routes/processRoutes');
+const schedulerRoutes = require('./routes/schedulerRoutes');  // ← add
+
 const processService = require('./services/processService');
 const cacheService = require('./services/cacheService');
 const { closeRedis } = require('./config/redis');
@@ -89,6 +91,7 @@ app.get('/status', statusHandler);
 app.get('/health', statusHandler);
 
 app.use('/api/process', processRoutes);
+app.use('/scheduler', schedulerRoutes);
 
 app.use((req, res) => {
   res.status(404).json({
