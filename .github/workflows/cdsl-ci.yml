@@ -1,0 +1,89 @@
+name: CDSL Quality Gate
+
+on:
+  push:
+    branches:
+      - cdsl_base
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secret-safety:
+    name: Secret Safety Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Check that secret files are not committed
+        run: |
+          echo "Checking for committed secret files..."
+
+          if git ls-files | grep -E '(^|/)\.env$|(^|/)backend/\.env$|(^|/)service-account\.json$|(^|/)backend/service-account\.json$'; then
+            echo "Secret file found in Git tracking."
+            echo "Remove .env or service-account.json before merging."
+            exit 1
+          fi
+
+          echo "No committed secret files found."
+
+  frontend-quality:
+    name: Frontend Lint and Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.33.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run frontend lint
+        run: pnpm run lint
+
+      - name: Run frontend build
+        run: pnpm run build
+
+  backend-syntax:
+    name: Backend Syntax Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Check all backend JavaScript files
+        working-directory: backend
+        run: npm run check
