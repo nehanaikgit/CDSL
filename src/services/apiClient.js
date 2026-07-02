@@ -140,6 +140,25 @@ export function getProcessStep(processCode, stepId, options = {}) {
     options,
   );
 }
+export function getStepLocks(processCode, options = {}) {
+  return request(
+    "GET",
+    `/api/process/${segment(processCode)}/locks`,
+    null,
+    options,
+  );
+}
+export function getStatusUpdateJob(jobId, options = {}) {
+  return request(
+    "GET",
+    `/api/process/status-updates/${segment(jobId)}`,
+    null,
+    {
+      ...options,
+      dedupe: false,
+    },
+  );
+}
 
 export function initProcessDay(processCode, processDate = null, options = {}) {
   return request(
@@ -169,6 +188,7 @@ export function updateStepStatus(
       remark: remark || "",
     },
     {
+      timeoutMs: options.timeoutMs ?? 30000,
       ...options,
       dedupe: false,
     },

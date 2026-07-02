@@ -112,16 +112,40 @@ const server = app.listen(PORT, () => {
 
   if (processCodes.length > 0) {
     setImmediate(async () => {
-      for (const processCode of processCodes) {
-        try {
-          const result = await processService.getProcessSteps(processCode);
-          console.log(
-            `[warmup] ${processCode} ready from ${result.source || 'unknown'}`,
-          );
-        } catch (error) {
-          console.warn(`[warmup] ${processCode} failed:`, error.message);
+      const concurrency = Math.max(
+        1,
+        Math.min(
+          Number.parseInt(process.env.CACHE_WARM_CONCURRENCY || '2', 10) || 2,
+          5,
+        ),
+      );
+
+      let nextIndex = 0;
+
+      async function warmWorker() {
+        while (nextIndex < processCodes.length) {
+          const index = nextIndex;
+          nextIndex += 1;
+          const processCode = processCodes[index];
+
+          try {
+            const [result] = await Promise.all([
+              processService.getProcessSteps(processCode),
+              processService.getStepLocks(processCode),
+            ]);
+
+            console.log(
+              `[warmup] ${processCode} ready from ${result.source || 'unknown'}`,
+            );
+          } catch (error) {
+            console.warn(`[warmup] ${processCode} failed:`, error.message);
+          }
         }
       }
+
+      await Promise.all(
+        Array.from({ length: concurrency }, () => warmWorker()),
+      );
     });
   }
 });

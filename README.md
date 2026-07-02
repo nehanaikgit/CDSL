@@ -1,180 +1,170 @@
 # CDSL Operations Dashboard
 
-Internal operations tracking and process automation dashboard for the GEPL Capital Depository team. Built to replace manual Google Apps Script workflows with a modern, reliable, and scalable system.
+Production-oriented operations dashboard for GEPL Capital's CDSL processes.
 
----
+## Current architecture
 
-## Overview
+- Frontend: React + Vite on port `5173`
+- Backend: Node.js + Express on port `5001`
+- Redis: fresh/stale cache plus asynchronous status-update queue
+- Database: BigQuery
+- GCP project: `gepl-operations`
+- CDSL datasets: `asia-south1`
+- Shared source tables such as BuddySystem: `US`
+- Cross-region rule: read the US source in a separate query, then write a local `asia-south1` mirror. Never join US and `asia-south1` tables in one query.
 
-The CDSL Operations Dashboard tracks daily FMS (File Management System) processes across the Depository department. Each process consists of steps that need to be completed by specific team members within defined SLA times.
-
-Key features:
-- Live dashboard showing today's process steps and their status
-- Automatic assignment based on live attendance from HRMantra (buddy logic)
-- SLA tracking with overdue alerts
-- Full audit trail of who did what and when
-- Generic architecture — one codebase handles all 23 FMS processes
-
----
-
-
-## Architecture
-
-React (Vite)
-↓
-Node.js + Express (Cloud Run)
-↓
-Google BigQuery (asia-south1)
-↓
-HRMantra / universal-table-store (US)
-### BigQuery Datasets
+## BigQuery datasets
 
 | Dataset | Region | Purpose |
 |---|---|---|
-| CDSL_CONFIG | asia-south1 | step_master, process_master, buddy_master |
-| CDSL_RUNTIME | asia-south1 | process_tracker, stored procedures |
-| CDSL_REPORTING | asia-south1 | views for dashboard |
-| CDSL_LOGS_NEW | asia-south1 | audit log |
-| CDSL_ARCHIVE | US | archived process data |
+| `CDSL_CONFIG` | asia-south1 | Process, step, calendar, status, and buddy configuration |
+| `CDSL_RUNTIME` | asia-south1 | Live `process_tracker` state and stored procedures |
+| `CDSL_LOGS_NEW` | asia-south1 | Append-only step audit log |
+| `CDSL_ARCHIVE` | asia-south1 | End-of-day process snapshots |
+| `CDSL_REPORTING` | asia-south1 | Reporting views |
+| `universal-table-store.BuddySystem` | US | Read-only buddy and attendance source |
 
----
+## Important typed-schema changes
 
-## Stack
+The deployed BigQuery environment uses:
 
-| Layer | Technology |
-|---|---|
-| Frontend | React 18, Vite, React Router v7 |
-| Backend | Node.js, Express |
-| Database | Google BigQuery |
-| Hosting | Google Cloud Run |
-| Scheduling | Google Cloud Scheduler |
-| Auth (planned) | Google OAuth |
+- `CDSL_CONFIG.process_master.planned_time_value TIME`
+- `CDSL_CONFIG.trading_calendar.trade_date DATE`
+- `CDSL_CONFIG.fx_is_working_day(DATE)`
+- No application dependency on the removed legacy fields:
+  - `process_master.planned_time`
+  - `trading_calendar.dd_mm_yyyy_slash`
 
----
+A read-only verification script is included at `sql/verify_current_state.sql`.
 
-## Project Structure
-CDSL/
-├── backend/
-│   ├── config/
-│   │   └── bigQueryClient.js
-│   ├── controllers/
-│   │   └── processController.js
-│   ├── middleware/
-│   │   └── errorHandler.js
-│   ├── routes/
-│   │   └── processRoutes.js
-│   ├── services/
-│   │   └── processService.js
-│   └── server.js
-├── src/
-│   ├── assets/
-│   │   └── gepl-logo.jpg
-│   ├── components/
-│   │   └── Logo.jsx
-│   ├── pages/
-│   │   ├── ProcessDashboard.jsx
-│   │   └── ProcessDashboard.css
-│   ├── services/
-│   │   └── apiClient.js
-│   ├── utils/
-│   │   └── processUtils.js
-│   ├── App.jsx
-│   └── main.jsx
-├── .github/
-│   └── workflows/
-│       └── cdsl-ci.yml
-└── package.json
----
+## Working features
 
-## FMS Processes
+- Process list and live process-step APIs
+- Redis fresh/stale caching
+- Buddy assignment: SELF -> BUDDY -> REPORTING -> ADMIN
+- Asynchronous step-status queue backed by Redis Streams
+- Atomic BigQuery commit through `sp_mark_step_status`
+- Audit logging
+- Process initialization and archive endpoints
+- Scheduler endpoints protected with `X-Scheduler-Secret`
+- Typed trading-calendar working-day check
+- Non-blocking frontend notifications
+- Optimistic status updates
+- Separate frontend read/write timeouts
+- Lint-clean React dashboard
+- Fixed Vite port with `strictPort: true`
 
-| Process Code | Process Name | Steps | Status |
-|---|---|---|---|
-| ST_BOD_FMS | File Download BOD FMS | 13 | ✅ Live |
-| More coming | — | — | ⏳ Pending |
+## Daily scheduler endpoints
 
----
-
-## API Endpoints
-
-| Method | Endpoint | Description |
+| Time IST | Endpoint | Job |
 |---|---|---|
-| GET | /health | Health check |
-| GET | /api/process/:processCode | Get all steps for latest day |
-| GET | /api/process/:processCode/steps/:stepId | Get single step |
-| POST | /api/process/:processCode/init | Initialize today's rows |
-| POST | /api/process/:processCode/archive | Archive a day |
-| PATCH | /api/process/:processCode/steps/:stepId/status | Update step status |
-| GET | /api/process/:processCode/audit | Full audit log |
-| GET | /api/process/:processCode/steps/:stepId/audit | Step audit log |
+| 7:00 AM | `POST /scheduler/sync-buddy` | US BuddySystem -> local `buddy_master` |
+| 8:00 AM | `POST /scheduler/init-all` | Initialize all active processes |
+| 6:00 PM | `POST /scheduler/archive-all` | Archive the previous process date |
 
----
+All scheduler calls require:
 
-## Buddy Assignment Logic
-
-On every dashboard load, the backend queries HRMantra live to determine who is assigned to each step:
-
-| Condition | Assignment | Label |
-|---|---|---|
-| Owner present and not on leave | Owner | SELF |
-| Owner absent, buddy present | Buddy | BUDDY |
-| Owner + buddy absent, RM present | Reporting Manager | REPORTING |
-| All absent | systems@geplcapital.com | ADMIN |
-
----
-
-## Environment Variables
-
-Create `backend/.env`:
-
-PORT=5001
-BQ_LOCATION=asia-south1
-GCP_PROJECT_ID=gepl-operations
-BQ_DATASET_REPORTING=CDSL_REPORTING
-BQ_DATASET_RUNTIME=CDSL_RUNTIME
-
----
-
-## Local Development
-
-```bash
-# Install dependencies
-pnpm install
-
-# Start backend
-cd backend && pnpm dev
-
-# Start frontend (new terminal)
-cd .. && pnpm dev
+```text
+X-Scheduler-Secret: <SCHEDULER_SECRET>
 ```
 
-Frontend: http://localhost:5173
-Backend: http://localhost:5001
+## Local setup
 
----
+### Frontend
 
-## Deployment
+```powershell
+Copy-Item .env.example .env
+npm install
+npm run lint
+npm run build
+npm run dev
+```
 
-Backend deploys to Google Cloud Run:
+Frontend URL:
 
-```bash
+```text
+http://localhost:5173
+```
+
+Vite uses `strictPort: true`; if port 5173 is occupied, startup fails instead of silently switching to another port.
+
+### Backend
+
+```powershell
 cd backend
-gcloud run deploy cdsl-backend \
-  --source . \
-  --region asia-south1 \
-  --platform managed \
-  --allow-unauthenticated
+Copy-Item .env.example .env
+npm install
+npm run check
+npm run dev
 ```
 
----
+Backend URL:
 
-## Pending
+```text
+http://localhost:5001
+```
 
-- [ ] Cloud Run deployment
-- [ ] Cloud Scheduler (auto init 8 AM, archive 6 PM)
-- [ ] Google Chat notifications
-- [ ] Seed remaining 22 FMS
-- [ ] Google OAuth authentication
-- [ ] File watcher (auto-mark steps when file arrives)
-- [ ] Manager overview dashboard
+Health check:
 
+```text
+GET http://localhost:5001/health
+```
+
+## Main API routes
+
+| Method | Route | Purpose |
+|---|---|---|
+| GET | `/api/process` | List active processes |
+| GET | `/api/process/:processCode` | Get today's process steps |
+| GET | `/api/process/:processCode/steps/:stepId` | Get one fresh step |
+| PATCH | `/api/process/:processCode/steps/:stepId/status` | Queue a step update; normally returns `202 Accepted` |
+| GET | `/api/process/status-updates/:jobId` | Read queued update status |
+| POST | `/api/process/:processCode/init` | Initialize one process |
+| POST | `/api/process/:processCode/archive` | Archive one process date |
+| GET | `/api/process/:processCode/audit` | Process audit log |
+| POST | `/scheduler/sync-buddy` | Buddy mirror sync |
+| POST | `/scheduler/init-all` | Initialize all processes |
+| POST | `/scheduler/archive-all` | Archive all processes |
+
+## Status-update performance
+
+The browser no longer waits for the BigQuery script to finish. The normal flow is:
+
+```text
+PATCH status -> Redis Stream -> 202 Accepted -> worker -> BigQuery commit -> UI polling confirmation
+```
+
+The PATCH response should normally return in milliseconds. The UI shows `Saving…` until the Redis job reports `COMPLETED`. `sp_mark_step_status` remains the authoritative validation and write layer and still performs the tracker update plus audit insert atomically.
+
+The backend logs both queue and BigQuery timings:
+
+```text
+[status-queue] completed job=<id> <process>/<step> attempt=1 duration=<ms>
+[process] status-update <process>/<step> bigquery=<ms> total=<ms>
+```
+
+When Redis is unavailable, the API deliberately falls back to the original synchronous BigQuery update so functionality is preserved, although that fallback can take several seconds.
+
+Queue configuration is documented in `docs/ASYNC_STATUS_QUEUE.md`.
+
+## Files not included in Git or ZIP
+
+These must be supplied locally:
+
+- `.env`
+- `backend/.env`
+- `node_modules`
+- `dist`
+- service-account files
+
+Use the included `.env.example` files as templates.
+
+## Remaining phases
+
+- Google OAuth and `@geplcapital.com` token validation
+- Dependency locking engine
+- Google Chat notifications
+- Cloud Run + Memorystore
+- Cloud Scheduler job creation
+- Production domain deployment
+- Remaining FMS process onboarding

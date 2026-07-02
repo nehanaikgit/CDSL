@@ -16,6 +16,7 @@ const DATASET_LOGS     = process.env.BQ_DATASET_LOGS     || 'CDSL_LOGS_NEW';
 const ADMIN_EMAIL      = String(process.env.CDSL_ADMIN_EMAIL || '').trim().toLowerCase();
 
 const inFlightStepLoads = new Map();
+const inFlightLockLoads = new Map();
 
 // ── Date helpers ──────────────────────────────────────────────────────────────
 function getTodayIST() {
@@ -312,6 +313,94 @@ async function getProcessSteps(rawProcessCode) {
   return result;
 }
 
+// ── Dependency locks (empty results are cached too) ───────────────────────────
+async function loadStepLocksFromBigQuery(processCode, processDate) {
+  const [rows] = await directQuery({
+    query: `
+      WITH tracker_today AS (
+        SELECT
+          step_id,
+          completed,
+          step_status,
+          last_status_value
+        FROM \`${projectId}.${DATASET_RUNTIME}.process_tracker\`
+        WHERE process_code = @processCode
+          AND process_date = @processDate
+      ),
+      condition_groups AS (
+        SELECT
+          sc.step_id,
+          sc.condition_group,
+          LOGICAL_OR(
+            COALESCE(
+              IF(
+                sc.required_status IS NULL,
+                UPPER(TRIM(COALESCE(pt.completed, ''))) IN ('YES', 'EXCEPTION'),
+                UPPER(TRIM(COALESCE(pt.last_status_value, pt.step_status, '')))
+                  = UPPER(TRIM(sc.required_status))
+              ),
+              FALSE
+            )
+          ) AS group_satisfied
+        FROM \`${projectId}.${DATASET_CONFIG}.step_conditions\` sc
+        LEFT JOIN tracker_today pt
+          ON pt.step_id = sc.required_step_id
+        WHERE sc.process_code = @processCode
+          AND sc.is_active    = TRUE
+        GROUP BY sc.step_id, sc.condition_group
+      )
+      SELECT
+        step_id,
+        COALESCE(LOGICAL_AND(group_satisfied), FALSE) AS is_unlocked
+      FROM condition_groups
+      GROUP BY step_id
+      ORDER BY step_id
+    `,
+    location,
+    params: {
+      processCode,
+      processDate: bigquery.date(processDate),
+    },
+  });
+
+  const locks = Object.fromEntries(
+    rows.map((row) => [
+      String(row.step_id),
+      row.is_unlocked === true,
+    ]),
+  );
+
+  // Always cache the result. An empty object means the process has no active
+  // dependency conditions; it is valid data, not a cache miss.
+  await cacheService.setLocks(processCode, processDate, locks);
+  return locks;
+}
+
+function getOrCreateLockLoad(processCode, processDate) {
+  const loadKey = `${processCode}:${processDate}`;
+  const existing = inFlightLockLoads.get(loadKey);
+  if (existing) return existing;
+
+  const loadPromise = loadStepLocksFromBigQuery(processCode, processDate)
+    .finally(() => { inFlightLockLoads.delete(loadKey); });
+
+  inFlightLockLoads.set(loadKey, loadPromise);
+  return loadPromise;
+}
+
+async function getStepLocks(rawProcessCode) {
+  const processCode = normalizeProcessCode(rawProcessCode);
+  const processDate = getTodayIST();
+  const cached = await cacheService.getLocks(processCode, processDate);
+
+  // Important: {} is a valid cached value. Only null means cache miss.
+  if (cached !== null) {
+    return cached;
+  }
+
+  return getOrCreateLockLoad(processCode, processDate);
+}
+
 // ── Get single step (always fresh) ───────────────────────────────────────────
 async function getProcessStep(rawProcessCode, stepId) {
   const processCode = normalizeProcessCode(rawProcessCode);
@@ -376,9 +465,30 @@ async function getProcessStep(rawProcessCode, stepId) {
 
 // ── Mark step status ──────────────────────────────────────────────────────────
 async function updateStepStatus(rawProcessCode, stepId, newStatus, changedBy, remark = '') {
-  const processCode     = normalizeProcessCode(rawProcessCode);
-  const processDate     = getTodayIST();
+  const processCode      = normalizeProcessCode(rawProcessCode);
+  const processDate      = getTodayIST();
+  const normalizedStepId = String(stepId || '').trim();
   const normalizedStatus = String(newStatus || '').trim();
+  const normalizedChangedBy = String(changedBy || '').trim().toLowerCase();
+  const normalizedRemark = String(remark || '').trim();
+
+  if (!normalizedStepId) {
+    const error = new Error('stepId is required');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if (!normalizedStatus) {
+    const error = new Error('status is required');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if (!normalizedChangedBy) {
+    const error = new Error('changed_by is required');
+    error.statusCode = 400;
+    throw error;
+  }
 
   // Validate status against step_master.allowed_statuses
   const [validationRows] = await directQuery({
@@ -392,12 +502,12 @@ async function updateStepStatus(rawProcessCode, stepId, newStatus, changedBy, re
         AND allowed_status  = @newStatus
     `,
     location,
-    params: { processCode, stepId, newStatus: normalizedStatus },
+    params: { processCode, stepId: normalizedStepId, newStatus: normalizedStatus },
   });
 
   const isPending = normalizedStatus.toUpperCase() === 'PENDING';
   if (!isPending && Number(validationRows[0]?.cnt || 0) === 0) {
-    const error = new Error(`Invalid status "${normalizedStatus}" for step "${stepId}" in process "${processCode}"`);
+    const error = new Error(`Invalid status "${normalizedStatus}" for step "${normalizedStepId}" in process "${processCode}"`);
     error.statusCode = 400;
     throw error;
   }
@@ -418,23 +528,30 @@ async function updateStepStatus(rawProcessCode, stepId, newStatus, changedBy, re
     params: {
       processDate : bigquery.date(processDate),
       processCode,
-      stepId,
+      stepId      : normalizedStepId,
       newStatus   : normalizedStatus,
-      changedBy   : String(changedBy || 'SYSTEM').trim(),
-      remark      : String(remark || '').trim(),
+      changedBy   : normalizedChangedBy,
+      remark      : normalizedRemark,
     },
   });
 
-  // Bust cache immediately
-  await cacheService.bustProcess(processCode, processDate);
+  // Remove only fresh data after a normal user action. Preserve the stale
+  // snapshot so the next dashboard request is immediate, then rebuild fresh
+  // and stale caches asynchronously from BigQuery.
+  await Promise.all([
+    cacheService.bustStepsFresh(processCode, processDate),
+    cacheService.bustLocks(processCode, processDate),
+  ]);
+
+  refreshStaleStepsInBackground(processCode, processDate);
 
   return {
     process_code: processCode,
     process_date: processDate,
-    step_id     : stepId,
+    step_id     : normalizedStepId,
     new_status  : normalizedStatus,
-    changed_by  : changedBy || 'SYSTEM',
-    message     : `Step ${stepId} updated to "${normalizedStatus}"`,
+    changed_by  : normalizedChangedBy,
+    message     : `Status request for ${normalizedStepId} processed successfully`,
   };
 }
 
@@ -477,7 +594,10 @@ async function initProcessDay(rawProcessCode, processDate) {
     params: { processDate: bigquery.date(dateToInit), processCode },
   });
 
-  await cacheService.bustProcess(processCode, dateToInit);
+  await Promise.all([
+    cacheService.bustProcess(processCode, dateToInit),
+    cacheService.bustLocks(processCode, dateToInit),
+  ]);
 
   return {
     process_code: processCode,
@@ -504,7 +624,10 @@ async function archiveProcessDay(rawProcessCode, processDate) {
     params: { processDate: bigquery.date(dateToArchive), processCode },
   });
 
-  await cacheService.bustProcess(processCode, dateToArchive);
+  await Promise.all([
+    cacheService.bustProcess(processCode, dateToArchive),
+    cacheService.bustLocks(processCode, dateToArchive),
+  ]);
 
   return {
     process_code: processCode,
@@ -634,6 +757,7 @@ function buildProcessResponse(processCode, steps) {
 module.exports = {
   getProcesses,
   getProcessSteps,
+  getStepLocks,
   getProcessStep,
   initProcessDay,
   updateStepStatus,

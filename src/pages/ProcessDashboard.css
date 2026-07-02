@@ -959,3 +959,25 @@ html, body, #root {
     width: auto;
   }
 }
+
+/* ── Asynchronous status queue ────────────────────────────────────────────── */
+.data-table tbody tr.row-saving {
+  background: #fffaf0;
+  box-shadow: inset 3px 0 0 var(--amber);
+}
+
+.status-label.saving {
+  color: var(--amber);
+}
+
+.status-job-text {
+  margin-left: auto;
+  border: 1px solid #fed7aa;
+  border-radius: 999px;
+  padding: 2px 6px;
+  background: var(--amber-bg);
+  color: var(--amber);
+  font-size: .61rem;
+  font-weight: 800;
+  letter-spacing: .3px;
+}

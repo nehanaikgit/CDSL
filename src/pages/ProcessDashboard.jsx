@@ -23,12 +23,16 @@ import {
 import {
   getProcessStep,
   getProcessSteps,
+  getStatusUpdateJob,
+  getStepLocks,
   updateStepStatus,
 } from "../services/apiClient";
 import "./ProcessDashboard.css";
 
+
 const USER_EMAIL_STORAGE_KEY = "cdsl_user_email";
 const EMPTY_STEPS = Object.freeze([]);
+const EMPTY_LOCKS = Object.freeze({});
 
 function normalizeUserEmail(value) {
   return String(value || "").trim().toLowerCase();
@@ -188,8 +192,33 @@ const AppNotice = memo(function AppNotice({ notice, onClose }) {
   );
 });
 
-function getInitialSelectedStatus(stepStatus, uiStatus) {
+function getInitialSelectedStatus(stepStatus, uiStatus, pendingStatus) {
+  if (pendingStatus) return pendingStatus;
   return stepStatus === "PENDING" ? "" : (uiStatus || "");
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+function overlayPendingSteps(processData, pendingJobs) {
+  if (!processData || !Array.isArray(processData.steps)) return processData;
+
+  return {
+    ...processData,
+    steps: processData.steps.map((step) => {
+      const pendingJob = pendingJobs?.[step.step_id];
+      if (!pendingJob) return step;
+
+      return {
+        ...step,
+        ui_status: pendingJob.requested_status,
+        pending_status: pendingJob.requested_status,
+        pending_remark: pendingJob.remark || "",
+        is_overdue: false,
+      };
+    }),
+  };
 }
 
 // ── Step Row ──────────────────────────────────────────────────────────────────
@@ -198,49 +227,93 @@ const StepRow = memo(function StepRow({
   onStatusChange,
   onNotify,
   updating,
+  pendingJob,
   canUpdate,
+  isLocked,
 }) {
   const stepStatuses      = getStepAllowedStatuses(step);
   const exceptionStatuses = Array.isArray(step.exception_statuses) ? step.exception_statuses : [];
 
   // PENDING steps show the placeholder until a user selects a status.
   const [selected, setSelected] = useState(() =>
-    getInitialSelectedStatus(step.step_status, step.ui_status),
+    getInitialSelectedStatus(
+      step.step_status,
+      step.ui_status,
+      step.pending_status,
+    ),
   );
   const [remark, setRemark]     = useState("");
 
   // Fix: no setState in effect — use layout effect with ref comparison
-  const prevStepRef = useRef({ ui_status: step.ui_status, step_id: step.step_id, step_status: step.step_status });
+  const prevStepRef = useRef({
+    ui_status: step.ui_status,
+    step_id: step.step_id,
+    step_status: step.step_status,
+    pending_status: step.pending_status,
+  });
   useEffect(() => {
     const prev = prevStepRef.current;
     if (
       prev.step_id !== step.step_id ||
       prev.ui_status !== step.ui_status ||
-      prev.step_status !== step.step_status
+      prev.step_status !== step.step_status ||
+      prev.pending_status !== step.pending_status
     ) {
       prevStepRef.current = {
         ui_status: step.ui_status,
         step_id: step.step_id,
         step_status: step.step_status,
+        pending_status: step.pending_status,
       };
-      setSelected(getInitialSelectedStatus(step.step_status, step.ui_status));
+      setSelected(getInitialSelectedStatus(
+        step.step_status,
+        step.ui_status,
+        step.pending_status,
+      ));
       setRemark("");
     }
-  }, [step.step_id, step.step_status, step.ui_status]);
+  }, [
+    step.pending_status,
+    step.step_id,
+    step.step_status,
+    step.ui_status,
+  ]);
 
-  const { label, cls } = getStatusLabel(selected || step.ui_status, step.is_overdue, step.completed);
-  const isBusy   = updating === step.step_id;
-  const rowClass = getRowClass(step);
+  const { label, cls } = pendingJob
+    ? {
+        label: pendingJob.status === "RETRYING" ? "Retrying…" : "Saving…",
+        cls: "saving",
+      }
+    : getStatusLabel(
+        selected || step.ui_status,
+        step.is_overdue,
+        step.completed,
+      );
+  const isBusy = updating === step.step_id || Boolean(pendingJob);
+  const isDisabled = isBusy || !canUpdate || isLocked;
+  const rowClass = [
+    pendingJob ? `${getRowClass(step)} row-saving` : getRowClass(step),
+    isLocked ? "row-locked" : "",
+  ].filter(Boolean).join(" ");
 
   // Show remark box when exception status is selected
   const showRemarkBox = exceptionStatuses.length > 0 && exceptionStatuses.includes(selected);
 
   // Show Save button when selection changed or remark added
-  const initialSelected = getInitialSelectedStatus(step.step_status, step.ui_status);
+  const initialSelected = getInitialSelectedStatus(
+    step.step_status,
+    step.ui_status,
+    step.pending_status,
+  );
   const showSave = (selected !== "" && selected !== initialSelected) ||
                    (showRemarkBox && remark.trim().length > 0);
 
   const handleSave = async () => {
+    if (isLocked) {
+      onNotify("warning", `${step.step_id} is waiting on a dependency and cannot be updated yet.`);
+      return;
+    }
+
     if (!selected) {
       onNotify("warning", "Please select a status first.");
       return;
@@ -329,7 +402,8 @@ const StepRow = memo(function StepRow({
           <select
             value={selected}
             onChange={(e) => { setSelected(e.target.value); setRemark(""); }}
-            disabled={isBusy || !canUpdate}
+            disabled={isDisabled}
+            title={isLocked ? "Waiting on a dependency — locked until it clears" : undefined}
             className="status-select"
           >
             {/* Placeholder shown for PENDING steps */}
@@ -347,7 +421,7 @@ const StepRow = memo(function StepRow({
               value={remark}
               onChange={(e) => setRemark(e.target.value)}
               placeholder="Reason required for exception status"
-              disabled={isBusy || !canUpdate}
+              disabled={isDisabled}
               rows={2}
               style={{
                 width: "100%", marginTop: 6, padding: "4px 6px",
@@ -372,11 +446,25 @@ const StepRow = memo(function StepRow({
 
           <div className="status-footer">
             <span className={`status-label ${cls}`}>{label}</span>
+            {pendingJob && (
+              <span className="status-job-text">
+                {pendingJob.status || "QUEUED"}
+              </span>
+            )}
+            {isLocked && !pendingJob && (
+              <span
+                className="status-label locked"
+                title="Waiting on a dependency"
+                style={{ color: "var(--amber)", fontWeight: 700 }}
+              >
+                Locked
+              </span>
+            )}
             {showSave && (
               <button
                 type="button"
                 onClick={handleSave}
-                disabled={isBusy || !canUpdate}
+                disabled={isDisabled}
                 className="save-btn"
               >
                 {isBusy ? "..." : "Save"}
@@ -402,6 +490,8 @@ export default function ProcessDashboard() {
   const [lastRefresh, setLastRefresh] = useState(null);
   const [currentUser, setCurrentUser] = useState(() => getUserEmail());
   const [notice, setNotice]       = useState(null);
+  const [pendingJobs, setPendingJobs] = useState({});
+  const [locks, setLocks]         = useState(EMPTY_LOCKS);
 
   const dataRef             = useRef(null);
   const requestSequenceRef  = useRef(0);
@@ -411,6 +501,8 @@ export default function ProcessDashboard() {
   const noticeTimerRef      = useRef(null);
   const updatingRef         = useRef(null);
   const statusCheckTimersRef = useRef(new Set());
+  const pendingJobsRef      = useRef({});
+  const jobPollTokensRef    = useRef(new Map());
 
 
   const dismissNotice = useCallback(() => {
@@ -466,6 +558,7 @@ export default function ProcessDashboard() {
 
   useEffect(() => {
     const statusCheckTimers = statusCheckTimersRef.current;
+    const jobPollTokens = jobPollTokensRef.current;
 
     return () => {
       if (noticeTimerRef.current !== null) {
@@ -476,12 +569,22 @@ export default function ProcessDashboard() {
         window.clearTimeout(timerId);
       });
       statusCheckTimers.clear();
+
+      jobPollTokens.forEach((token) => {
+        token.cancelled = true;
+      });
+      jobPollTokens.clear();
     };
   }, []);
 
   const pollIntervalMs = (() => {
     const v = Number.parseInt(import.meta.env.VITE_POLL_INTERVAL_MS || "300000", 10);
     return Number.isFinite(v) && v >= 30000 ? v : 300000;
+  })();
+
+  const lockPollIntervalMs = (() => {
+    const v = Number.parseInt(import.meta.env.VITE_LOCK_POLL_INTERVAL_MS || "60000", 10);
+    return Number.isFinite(v) && v >= 15000 ? v : 60000;
   })();
 
   const fetchData = useCallback(async ({ background = false, force = false } = {}) => {
@@ -495,8 +598,12 @@ export default function ProcessDashboard() {
       const response = await getProcessSteps(processCode, { dedupe: !force });
       if (seq !== requestSequenceRef.current) return response;
 
-      dataRef.current = response.data;
-      setData(response.data);
+      const nextData = overlayPendingSteps(
+        response.data,
+        pendingJobsRef.current,
+      );
+      dataRef.current = nextData;
+      setData(nextData);
 
       const now = new Date();
       lastRefreshRef.current = now;
@@ -528,6 +635,16 @@ export default function ProcessDashboard() {
   // eslint-disable-next-line react-hooks/refs
   fetchDataRef.current = fetchData;
 
+  const fetchLocks = useCallback(async () => {
+    try {
+      const response = await getStepLocks(processCode, { dedupe: false });
+      setLocks(response?.data || EMPTY_LOCKS);
+    } catch (err) {
+      // Lock state is advisory for the UI — a failed fetch must not block the dashboard.
+      console.warn("[locks] refresh failed:", err.message);
+    }
+  }, [processCode]);
+
   // Initial load + polling
   useEffect(() => {
     dataRef.current = null;
@@ -540,14 +657,28 @@ export default function ProcessDashboard() {
     setRefreshing(false);
     setError(null);
     setLastRefresh(null);
+    setLocks(EMPTY_LOCKS);
+    pendingJobsRef.current = {};
+    setPendingJobs({});
+    jobPollTokensRef.current.forEach((token) => {
+      token.cancelled = true;
+    });
+    jobPollTokensRef.current.clear();
 
     void fetchData({ force: false }).catch(() => {});
+    void fetchLocks();
 
     const interval = window.setInterval(() => {
       if (!document.hidden) {
         void fetchData({ background: true }).catch(() => {});
       }
     }, pollIntervalMs);
+
+    const lockInterval = window.setInterval(() => {
+      if (!document.hidden) {
+        void fetchLocks();
+      }
+    }, lockPollIntervalMs);
 
     const handleVisibilityChange = () => {
       if (document.hidden) return;
@@ -561,13 +692,14 @@ export default function ProcessDashboard() {
 
     return () => {
       window.clearInterval(interval);
+      window.clearInterval(lockInterval);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       if (retryTimerRef.current !== null) {
         window.clearTimeout(retryTimerRef.current);
         retryTimerRef.current = null;
       }
     };
-  }, [fetchData, pollIntervalMs]);
+  }, [fetchData, fetchLocks, pollIntervalMs, lockPollIntervalMs]);
 
 
   const applyFreshStep = useCallback((stepId, freshStep) => {
@@ -593,6 +725,8 @@ export default function ProcessDashboard() {
             ...step,
             ...freshStep,
             ui_status: uiStatus,
+            pending_status: null,
+            pending_remark: null,
             is_overdue:
               String(freshStep.step_status || "").toUpperCase() === "PENDING"
                 ? step.is_overdue
@@ -630,6 +764,185 @@ export default function ProcessDashboard() {
     });
   }, [refreshSingleStep]);
 
+  const setPendingJobInfo = useCallback((stepId, jobInfo) => {
+    const next = {
+      ...pendingJobsRef.current,
+      [stepId]: jobInfo,
+    };
+
+    pendingJobsRef.current = next;
+    setPendingJobs(next);
+
+    setData((current) => {
+      if (!current || !Array.isArray(current.steps)) return current;
+
+      const updated = {
+        ...current,
+        steps: current.steps.map((step) =>
+          step.step_id === stepId
+            ? {
+                ...step,
+                ui_status: jobInfo.requested_status,
+                pending_status: jobInfo.requested_status,
+                pending_remark: jobInfo.remark || "",
+                is_overdue: false,
+              }
+            : step,
+        ),
+      };
+
+      dataRef.current = updated;
+      return updated;
+    });
+  }, []);
+
+  const clearPendingJobInfo = useCallback((stepId) => {
+    const next = { ...pendingJobsRef.current };
+    delete next[stepId];
+    pendingJobsRef.current = next;
+    setPendingJobs(next);
+  }, []);
+
+  const restoreStep = useCallback((stepId, previousStep) => {
+    if (!previousStep) return;
+
+    setData((current) => {
+      if (!current || !Array.isArray(current.steps)) return current;
+
+      const restored = {
+        ...current,
+        steps: current.steps.map((step) =>
+          step.step_id === stepId ? previousStep : step,
+        ),
+      };
+
+      dataRef.current = restored;
+      return restored;
+    });
+  }, []);
+
+  const applyCommittedStatus = useCallback((
+    stepId,
+    requestedStatus,
+    remark,
+  ) => {
+    setData((current) => {
+      if (!current || !Array.isArray(current.steps)) return current;
+
+      const committed = {
+        ...current,
+        steps: current.steps.map((step) => {
+          if (step.step_id !== stepId) return step;
+
+          const isException = Array.isArray(step.exception_statuses) &&
+            step.exception_statuses.includes(requestedStatus);
+
+          return {
+            ...step,
+            ui_status: requestedStatus,
+            last_status_value: requestedStatus,
+            step_status: isException ? "EXCEPTION" : "COMPLETED",
+            completed: isException ? "EXCEPTION" : "YES",
+            exception_reason: isException ? remark : null,
+            pending_status: null,
+            pending_remark: null,
+            is_overdue: false,
+          };
+        }),
+      };
+
+      dataRef.current = committed;
+      return committed;
+    });
+  }, []);
+
+  const monitorStatusJob = useCallback(async ({
+    stepId,
+    jobId,
+    previousStep,
+    requestedStatus,
+    remark,
+  }) => {
+    const previousToken = jobPollTokensRef.current.get(stepId);
+    if (previousToken) previousToken.cancelled = true;
+
+    const token = { cancelled: false };
+    jobPollTokensRef.current.set(stepId, token);
+
+   for (let attempt = 0; attempt < 30; attempt += 1) {
+  await wait(attempt === 0 ? 1000 : 2000);
+      if (token.cancelled) return;
+
+      try {
+        const response = await getStatusUpdateJob(jobId, {
+          timeoutMs: 10000,
+          dedupe: false,
+        });
+        const job = response?.data;
+
+        if (!job) continue;
+
+        setPendingJobInfo(stepId, {
+          job_id: jobId,
+          status: job.status,
+          requested_status: job.requested_status || requestedStatus,
+          remark,
+        });
+
+        if (job.status === "COMPLETED") {
+          applyCommittedStatus(
+            stepId,
+            job.requested_status || requestedStatus,
+            remark,
+          );
+          clearPendingJobInfo(stepId);
+          jobPollTokensRef.current.delete(stepId);
+          showNotice("success", `${stepId} updated successfully.`, 2500);
+
+          void refreshSingleStep(stepId).catch(() => {
+            scheduleStatusChecks(stepId);
+          });
+          void fetchLocks();
+          return;
+        }
+
+        if (job.status === "FAILED") {
+          clearPendingJobInfo(stepId);
+          jobPollTokensRef.current.delete(stepId);
+          restoreStep(stepId, previousStep);
+          showNotice(
+            "error",
+            job.error?.message || `Unable to update ${stepId}.`,
+            7000,
+          );
+          return;
+        }
+      } catch (error) {
+        if (error?.statusCode !== 404 && attempt >= 4) {
+          console.warn("Status job polling failed:", error.message);
+        }
+      }
+    }
+
+    clearPendingJobInfo(stepId);
+    jobPollTokensRef.current.delete(stepId);
+    showNotice(
+      "warning",
+      `${stepId} is taking longer than expected. Refresh before retrying.`,
+      7000,
+    );
+    scheduleStatusChecks(stepId);
+  }, [
+    applyCommittedStatus,
+    clearPendingJobInfo,
+    fetchLocks,
+    refreshSingleStep,
+    restoreStep,
+    scheduleStatusChecks,
+    setPendingJobInfo,
+    showNotice,
+  ]);
+
   const handleStatusChange = useCallback(async (
     stepId,
     newStatus,
@@ -643,26 +956,32 @@ export default function ProcessDashboard() {
       return false;
     }
 
-    if (updatingRef.current) {
+    if (locks[stepId] === false) {
+      showNotice(
+        "warning",
+        `${stepId} is waiting on a dependency and cannot be updated yet.`,
+      );
+      return false;
+    }
+
+    if (updatingRef.current || pendingJobsRef.current[stepId]) {
       showNotice(
         "info",
-        `Step ${updatingRef.current} is already being updated.`,
+        `${stepId} is already being updated.`,
         3000,
       );
       return false;
     }
 
-    const previousData = dataRef.current;
-    const currentStep = previousData?.steps?.find(
+    const previousStep = dataRef.current?.steps?.find(
       (step) => step.step_id === stepId,
     );
-    const isException = Array.isArray(currentStep?.exception_statuses) &&
-      currentStep.exception_statuses.includes(newStatus);
 
     updatingRef.current = stepId;
     setUpdating(stepId);
 
-    // Optimistic UI: the row reacts immediately while BigQuery commits.
+    // Show the selected value immediately, but do not mark it completed until
+    // the Redis worker confirms that BigQuery committed successfully.
     setData((current) => {
       if (!current || !Array.isArray(current.steps)) return current;
 
@@ -673,10 +992,8 @@ export default function ProcessDashboard() {
             ? {
                 ...step,
                 ui_status: newStatus,
-                last_status_value: newStatus,
-                step_status: isException ? "EXCEPTION" : "COMPLETED",
-                completed: isException ? "EXCEPTION" : "YES",
-                exception_reason: isException ? remark : null,
+                pending_status: newStatus,
+                pending_remark: remark,
                 is_overdue: false,
               }
             : step,
@@ -688,13 +1005,42 @@ export default function ProcessDashboard() {
     });
 
     try {
-      await updateStepStatus(
+      const response = await updateStepStatus(
         processCode,
         stepId,
         newStatus,
         currentUser,
         remark,
       );
+      const result = response?.data || {};
+
+      if (result.mode === "ASYNC" && result.job_id) {
+        const requestedStatus = result.requested_status || newStatus;
+        const pendingJob = {
+          job_id: result.job_id,
+          status: result.status || "QUEUED",
+          requested_status: requestedStatus,
+          remark,
+        };
+
+        setPendingJobInfo(stepId, pendingJob);
+        showNotice(
+          "info",
+          result.duplicate
+            ? `${stepId} is already processing.`
+            : `${stepId} queued. Saving in the background.`,
+          3000,
+        );
+
+        void monitorStatusJob({
+          stepId,
+          jobId: result.job_id,
+          previousStep,
+          requestedStatus,
+          remark,
+        });
+        return true;
+      }
 
       showNotice("success", `${stepId} updated successfully.`, 2500);
 
@@ -704,26 +1050,13 @@ export default function ProcessDashboard() {
         scheduleStatusChecks(stepId);
       }
 
+      void fetchLocks();
       return true;
-    } catch (err) {
-      const isTimeout = err?.statusCode === 408 || err?.name === "AbortError";
-
-      if (isTimeout) {
-        // Do not roll back: BigQuery may still finish after the browser timeout.
-        showNotice(
-          "info",
-          "Update is still processing. The row will refresh automatically.",
-          7000,
-        );
-        scheduleStatusChecks(stepId);
-        return true;
-      }
-
-      dataRef.current = previousData;
-      setData(previousData);
+    } catch (error) {
+      restoreStep(stepId, previousStep);
       showNotice(
         "error",
-        err?.message || "Unable to update the step.",
+        error?.message || "Unable to update the step.",
         7000,
       );
       return false;
@@ -733,9 +1066,14 @@ export default function ProcessDashboard() {
     }
   }, [
     currentUser,
+    fetchLocks,
+    locks,
+    monitorStatusJob,
     processCode,
     refreshSingleStep,
+    restoreStep,
     scheduleStatusChecks,
+    setPendingJobInfo,
     showNotice,
   ]);
 
@@ -902,7 +1240,9 @@ export default function ProcessDashboard() {
                       onStatusChange={handleStatusChange}
                       onNotify={showNotice}
                       updating={updating}
+                      pendingJob={pendingJobs[step.step_id] || null}
                       canUpdate={Boolean(currentUser)}
+                      isLocked={locks[step.step_id] === false}
                     />
                   ))
                 )}

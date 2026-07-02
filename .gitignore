@@ -81,3 +81,15 @@ desktop.ini
 .pnpm-store/
 .pnpm-debug.log*
 
+
+.env
+backend/.env
+*.env
+!.env.example
+
+*.zip
+*.backup*
+*.backup.js
+
+node_modules/
+dist/
